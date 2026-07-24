@@ -227,9 +227,11 @@ CBM_ZOVA_TEST_RUNNER_DIR="$TMP/output" \
 CBM_ZOVA_FAKE_BUILD_LOG="$FAKE_BUILD_LOG" \
 CBM_ZOVA_FAKE_OUTPUT_DIR="$TMP/output" \
 CBM_ZOVA_TEST_CACHE_DIR="$TMP/test-cache" \
+CBM_ZOVA_TEST_CPU=baseline \
   bash "$ROOT/scripts/zova-run-tests.sh"
 [[ "$(wc -l < "$FAKE_BUILD_LOG" | tr -d ' ')" == "1" ]]
 grep -q ' test-runner -Dwith-zova=true ' "$FAKE_BUILD_LOG"
+grep -q -- '-Dcpu=baseline' "$FAKE_BUILD_LOG"
 echo "PASS: complete verification retains the full test runner"
 
 mkdir -p "$TMP/local-cache/h" "$TMP/build-cache/zig-global-cache/h"

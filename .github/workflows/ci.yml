@@ -69,14 +69,18 @@ jobs:
       - name: Install build dependencies
         run: sudo apt-get update && sudo apt-get install -y zlib1g-dev
       - uses: ./.github/actions/setup-zova
+        with:
+          cpu: baseline
       - name: Restore test build cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: build/.zova-build-cache
-          key: cbm-tests-${{ runner.os }}-${{ runner.arch }}-zig-0.16.0-zova-e492609d-${{ hashFiles('build.zig', 'src/**', 'internal/**', 'vendored/**', 'tests/**', 'scripts/zova-build-test-runner.sh', 'scripts/zova-cache-repair.sh') }}
+          key: cbm-tests-${{ runner.os }}-${{ runner.arch }}-cpu-baseline-zig-0.16.0-zova-e492609d-${{ hashFiles('build.zig', 'src/**', 'internal/**', 'vendored/**', 'tests/**', 'scripts/zova-build-test-runner.sh', 'scripts/zova-cache-repair.sh') }}
           restore-keys: |
-            cbm-tests-${{ runner.os }}-${{ runner.arch }}-zig-0.16.0-zova-e492609d-
+            cbm-tests-${{ runner.os }}-${{ runner.arch }}-cpu-baseline-zig-0.16.0-zova-e492609d-
       - name: Build complete C test runner
+        env:
+          CBM_ZOVA_TEST_CPU: baseline
         run: scripts/zova-build-test-runner.sh full
       - name: Package test runner
         run: tar -czf test-runner-linux-amd64.tar.gz -C build/c test-runner

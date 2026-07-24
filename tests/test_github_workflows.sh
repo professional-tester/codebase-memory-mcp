@@ -24,10 +24,10 @@ grep -q 'repository: ata-sesli/zova' "$ROOT/.github/actions/setup-zova/action.ym
 grep -q 'ref: e492609d480a60781c106012f11b17b2a1c9e330' \
   "$ROOT/.github/actions/setup-zova/action.yml"
 grep -q 'version: 0.16.0' "$ROOT/.github/actions/setup-zova/action.yml"
-[[ $(grep -c 'zig build c-abi' "$ROOT/.github/actions/setup-zova/action.yml") -eq 2 ]] || {
-  echo "error: native and cross-target Zova setup must build the C ABI artifact" >&2
-  exit 1
-}
+grep -q '^  cpu:' "$ROOT/.github/actions/setup-zova/action.yml"
+grep -Fq '${{ inputs.cpu }}' "$ROOT/.github/actions/setup-zova/action.yml"
+grep -q 'BUILD_ARGS=(c-abi' "$ROOT/.github/actions/setup-zova/action.yml"
+grep -q 'BUILD_ARGS+=(-Dcpu="$CPU")' "$ROOT/.github/actions/setup-zova/action.yml"
 grep -q 'actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9' \
   "$ROOT/.github/actions/setup-zova/action.yml"
 grep -q "steps.zova-cache.outputs.cache-hit != 'true'" \
@@ -43,6 +43,18 @@ grep -q '^  build:' "$WORKFLOWS/ci.yml"
 grep -q '^  test-build:' "$WORKFLOWS/ci.yml"
 grep -q '^  test:' "$WORKFLOWS/ci.yml"
 grep -q 'scripts/ci-test-shard.sh' "$WORKFLOWS/ci.yml"
+test_build_job=$(sed -n '/^  test-build:/,/^  test:/p' "$WORKFLOWS/ci.yml")
+[[ $(grep -c 'cpu: baseline' <<<"$test_build_job") -eq 1 ]] || {
+  echo "error: the shared test runner must use one baseline-CPU Zova build" >&2
+  exit 1
+}
+[[ $(grep -c 'CBM_ZOVA_TEST_CPU: baseline' <<<"$test_build_job") -eq 1 ]] || {
+  echo "error: the shared CBM test runner must target the baseline CPU" >&2
+  exit 1
+}
+grep -q 'key: cbm-tests-.*-cpu-baseline-' <<<"$test_build_job"
+grep -q 'CBM_ZOVA_TEST_CPU' "$ROOT/scripts/zova-build-test-runner.sh"
+grep -q -- '-Dcpu="$TEST_CPU"' "$ROOT/scripts/zova-build-test-runner.sh"
 bash "$ROOT/scripts/ci-test-shard.sh" --verify
 
 grep -q 'CBM_WITH_ZOVA=1' "$WORKFLOWS/_build.yml"

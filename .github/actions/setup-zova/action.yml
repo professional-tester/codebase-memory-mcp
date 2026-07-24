@@ -6,6 +6,10 @@ inputs:
     description: Optional Zig target triple for the Zova static library
     required: false
     default: ''
+  cpu:
+    description: Optional Zig CPU model/features for portable shared artifacts
+    required: false
+    default: ''
 
 runs:
   using: composite
@@ -29,7 +33,7 @@ runs:
           .ci/zova/zig-out
           ${{ runner.temp }}/zova-cache
           ${{ runner.temp }}/zig-global-cache
-        key: zova-${{ runner.os }}-${{ runner.arch }}-${{ inputs.target }}-zig-0.16.0-e492609d480a60781c106012f11b17b2a1c9e330
+        key: zova-${{ runner.os }}-${{ runner.arch }}-${{ inputs.target }}-${{ inputs.cpu }}-zig-0.16.0-e492609d480a60781c106012f11b17b2a1c9e330
 
     - name: Build pinned Zova
       if: steps.zova-cache.outputs.cache-hit != 'true'
@@ -37,23 +41,20 @@ runs:
       working-directory: ${{ github.workspace }}/.ci/zova
       env:
         TARGET: ${{ inputs.target }}
+        CPU: ${{ inputs.cpu }}
       run: |
         set -euo pipefail
         CACHE_ROOT="$RUNNER_TEMP"
         if command -v cygpath >/dev/null 2>&1; then
           CACHE_ROOT=$(cygpath -m "$CACHE_ROOT")
         fi
-        if [[ -n "$TARGET" ]]; then
-          zig build c-abi \
-            --cache-dir "$CACHE_ROOT/zova-cache" \
-            --global-cache-dir "$CACHE_ROOT/zig-global-cache" \
-            -Dtarget="$TARGET" -Doptimize=ReleaseSafe
-        else
-          zig build c-abi \
-            --cache-dir "$CACHE_ROOT/zova-cache" \
-            --global-cache-dir "$CACHE_ROOT/zig-global-cache" \
-            -Doptimize=ReleaseSafe
-        fi
+        BUILD_ARGS=(c-abi
+          --cache-dir "$CACHE_ROOT/zova-cache"
+          --global-cache-dir "$CACHE_ROOT/zig-global-cache"
+          -Doptimize=ReleaseSafe)
+        [[ -z "$TARGET" ]] || BUILD_ARGS+=(-Dtarget="$TARGET")
+        [[ -z "$CPU" ]] || BUILD_ARGS+=(-Dcpu="$CPU")
+        zig build "${BUILD_ARGS[@]}"
 
     - name: Normalize Windows archive name
       shell: bash

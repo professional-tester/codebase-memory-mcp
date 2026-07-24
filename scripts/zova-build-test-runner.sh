@@ -40,13 +40,20 @@ trap cleanup EXIT INT TERM
 
 ZIG_GLOBAL_CACHE="$CACHE_ROOT/zig-global-cache"
 CBM_ZIG_CACHE="$CACHE_ROOT/cbm-zig-cache"
+TEST_CPU=${CBM_ZOVA_TEST_CPU:-}
 mkdir -p "$ZIG_GLOBAL_CACHE" "$CBM_ZIG_CACHE"
 "$ROOT/scripts/zova-cache-repair.sh" "$CBM_ZIG_CACHE" "$ZIG_GLOBAL_CACHE"
 
 echo "BUILD TEST RUNNER: $GROUP" >&2
-zig build --cache-dir "$CBM_ZIG_CACHE" \
-  --global-cache-dir "$ZIG_GLOBAL_CACHE" \
-  "$TARGET" -Dwith-zova=true -Dzova-root="$ZOVA_ROOT"
+BUILD_ARGS=(
+  --cache-dir "$CBM_ZIG_CACHE"
+  --global-cache-dir "$ZIG_GLOBAL_CACHE"
+  "$TARGET"
+  -Dwith-zova=true
+  -Dzova-root="$ZOVA_ROOT"
+)
+[[ -z "$TEST_CPU" ]] || BUILD_ARGS+=(-Dcpu="$TEST_CPU")
+zig build "${BUILD_ARGS[@]}"
 
 [[ -x "$RUNNER" ]] || { echo "error: build did not produce $RUNNER" >&2; exit 1; }
 printf '%s\n' "$RUNNER"

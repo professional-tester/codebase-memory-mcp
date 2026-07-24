@@ -56,7 +56,7 @@ Full indexing remains the current tradeoff. Zova's advantage is strongest for re
 - **Fast updates after the first index** — native delta publication makes incremental indexing 51.6%–76.9% faster in the current TOPS and Deno benchmarks.
 - **Cross-repository context** — search frontend, backend, libraries, or any other selected project set in one query without requiring repository names such as `frontend` or `backend`.
 - **Exact results** — Zova-native benchmark parity is checked against the pure-SQLite implementation.
-- **Plug and play** — single static binary for macOS (arm64/amd64), Linux (arm64/amd64), and Windows (amd64). No Docker, no runtime dependencies, no API keys. Download → `install` → restart agent → done.
+- **Plug and play** — release binaries for macOS, Linux, and Windows on amd64 and arm64. No Docker, hosted service, or API key. Download → install → restart agent → done.
 - **158 languages** — vendored tree-sitter grammars compiled into the binary. Nothing to install, nothing that breaks.
 - **120x fewer tokens** — 5 structural queries: ~3,400 tokens vs ~412,000 via file-by-file search. One graph query replaces dozens of grep/read cycles.
 - **11 agents, one command** — `install` auto-detects Claude Code, Codex CLI, Gemini CLI, Zed, OpenCode, Antigravity, Aider, KiloCode, VS Code, OpenClaw, and Kiro — configures MCP entries, instruction files, and pre-tool hooks for each.
@@ -167,7 +167,7 @@ The MCP server also checks for updates on startup and notifies on the first tool
 codebase-memory-mcp uninstall
 ```
 
-Removes all agent configs, skills, hooks, and instructions. Does not remove the binary or SQLite databases.
+Removes the installed binary, agent configs, skills, hooks, and instructions. The shared `cbm.zova` database is kept.
 
 ## Features
 
@@ -212,11 +212,11 @@ Removes all agent configs, skills, hooks, and instructions. Does not remove the 
 - **Prepared Zova publication**: finalized nodes, grouped topology edges with compact payloads, metadata, FTS rows, and vectors are published atomically into the shared database.
 
 ### Distribution & operation
-- **Single static binary, zero infrastructure**: Zova embeds SQLite and persists the shared full-authority store at `~/.cache/codebase-memory-mcp/cbm.zova`.
+- **Single self-contained application, zero infrastructure**: Zova embeds SQLite and persists the shared full-authority store at `~/.cache/codebase-memory-mcp/cbm.zova`.
 - **Auto-sync**: Background watcher detects file changes and re-indexes automatically
 - **Route nodes**: REST endpoints are first-class graph entities
 - **CLI mode**: `codebase-memory-mcp cli search_graph '{"name_pattern": ".*Handler.*"}'`
-- **Available on**: npm, PyPI, Homebrew, Scoop, Winget, Chocolatey, AUR, `go install`
+- **Release archives**: signed-by-checksum binaries and installers for macOS, Linux, and Windows on amd64 and arm64.
 
 ## Team-Shared Graph Artifact
 
@@ -303,48 +303,17 @@ When you open a memory/performance issue, **attach the `.ndjson` trajectory** �
 | macOS (Intel) | `codebase-memory-mcp-darwin-amd64.tar.gz` | `codebase-memory-mcp-ui-darwin-amd64.tar.gz` |
 | Linux (x86_64) | `codebase-memory-mcp-linux-amd64.tar.gz` | `codebase-memory-mcp-ui-linux-amd64.tar.gz` |
 | Linux (ARM64) | `codebase-memory-mcp-linux-arm64.tar.gz` | `codebase-memory-mcp-ui-linux-arm64.tar.gz` |
+| Linux portable (x86_64) | `codebase-memory-mcp-linux-amd64-portable.tar.gz` | `codebase-memory-mcp-ui-linux-amd64-portable.tar.gz` |
+| Linux portable (ARM64) | `codebase-memory-mcp-linux-arm64-portable.tar.gz` | `codebase-memory-mcp-ui-linux-arm64-portable.tar.gz` |
 | Windows (x86_64) | `codebase-memory-mcp-windows-amd64.zip` | `codebase-memory-mcp-ui-windows-amd64.zip` |
+| Windows (ARM64) | `codebase-memory-mcp-windows-arm64.zip` | `codebase-memory-mcp-ui-windows-arm64.zip` |
 
-Every release includes `checksums.txt` with SHA-256 hashes. All binaries are statically linked — no shared library dependencies.
+Every release includes `checksums.txt` with SHA-256 hashes, and the canonical
+installer refuses an unverified network download. The portable Linux archives
+are statically linked; the standard Linux archives target the release runner's
+glibc. The installer selects portable Linux by default.
 
 > **Windows note**: SmartScreen may show a warning for unsigned software. Click **"More info"** → **"Run anyway"**. Verify integrity with `checksums.txt`.
-
-### Setup Scripts
-
-<details>
-<summary>Automated download + install</summary>
-
-**macOS / Linux:**
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/0ctacity/codebase-memory-mcp/main/scripts/setup.sh | bash
-```
-
-**Windows (PowerShell):**
-
-```powershell
-irm https://raw.githubusercontent.com/0ctacity/codebase-memory-mcp/main/scripts/setup-windows.ps1 | iex
-```
-
-</details>
-
-### AUR (Arch Linux)
-
-```bash
-yay -S codebase-memory-mcp-bin
-```
-
-```bash
-paru -S codebase-memory-mcp-bin
-```
-
-The `codebase-memory-mcp-bin` package is available at: https://aur.archlinux.org/packages/codebase-memory-mcp-bin
-
-### Install via Claude Code
-
-```
-You: "Install this MCP server: https://github.com/0ctacity/codebase-memory-mcp"
-```
 
 ### Build from Source
 
@@ -707,7 +676,11 @@ Project config overrides global for conflicting extensions. An entry whose langu
 
 ## Persistence
 
-SQLite databases stored at `~/.cache/codebase-memory-mcp/`. Persists across restarts (WAL mode, ACID-safe). To reset: `rm -rf ~/.cache/codebase-memory-mcp/`.
+All indexed projects persist as isolated workspaces in the shared
+`${CBM_CACHE_DIR:-$HOME/.cache/codebase-memory-mcp}/cbm.zova` database. The
+database uses WAL mode and survives agent and machine restarts. Pure-SQLite
+per-project `.db` files are used only when the explicit compatibility mode
+`CBM_ZOVA_MODE=off` is selected.
 
 ## Troubleshooting
 

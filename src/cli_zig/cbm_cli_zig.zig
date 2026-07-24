@@ -57,7 +57,7 @@ export fn cbm_cli_zig_doctor_report(
     running_binary_ptr: [*:0]const u8,
     installed_binary_ptr: [*:0]const u8,
     cache_dir_ptr: [*:0]const u8,
-    project_dbs_ptr: [*:0]const u8,
+    database_path_ptr: [*:0]const u8,
     config_paths_ptr: [*:0]const u8,
     detected_agents_ptr: [*:0]const u8,
     path_ready: c_int,
@@ -79,8 +79,7 @@ export fn cbm_cli_zig_doctor_report(
 
     appendFmt(&list, allocator, "storage\n", .{}) catch return null;
     appendFmt(&list, allocator, "  cache: {s}\n", .{cspan(cache_dir_ptr)}) catch return null;
-    appendFmt(&list, allocator, "  project databases:\n", .{}) catch return null;
-    appendLines(&list, allocator, cspan(project_dbs_ptr), "(none found)") catch return null;
+    appendFmt(&list, allocator, "  database: {s}\n", .{cspan(database_path_ptr)}) catch return null;
     appendFmt(&list, allocator, "\n", .{}) catch return null;
 
     appendFmt(&list, allocator, "agents\n", .{}) catch return null;
@@ -102,7 +101,7 @@ export fn cbm_cli_zig_where_report(
     running_binary_ptr: [*:0]const u8,
     installed_binary_ptr: [*:0]const u8,
     cache_dir_ptr: [*:0]const u8,
-    project_dbs_ptr: [*:0]const u8,
+    database_path_ptr: [*:0]const u8,
     config_paths_ptr: [*:0]const u8,
 ) callconv(.c) ?[*:0]u8 {
     const allocator = std.heap.c_allocator;
@@ -112,8 +111,7 @@ export fn cbm_cli_zig_where_report(
     appendFmt(&list, allocator, "cache: {s}\n", .{cspan(cache_dir_ptr)}) catch return null;
     appendFmt(&list, allocator, "running_binary: {s}\n", .{cspan(running_binary_ptr)}) catch return null;
     appendFmt(&list, allocator, "installed_binary: {s}\n", .{cspan(installed_binary_ptr)}) catch return null;
-    appendFmt(&list, allocator, "project_databases:\n", .{}) catch return null;
-    appendLines(&list, allocator, cspan(project_dbs_ptr), "(none found)") catch return null;
+    appendFmt(&list, allocator, "database: {s}\n", .{cspan(database_path_ptr)}) catch return null;
     appendFmt(&list, allocator, "config_files:\n", .{}) catch return null;
     appendLines(&list, allocator, cspan(config_paths_ptr), "(none)") catch return null;
 

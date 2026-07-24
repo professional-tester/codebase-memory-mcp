@@ -1864,7 +1864,7 @@ TEST(cli_doctor_where_reports_paths) {
     snprintf(cache, sizeof(cache), "%s/cache", tmpdir);
     test_mkdirp(cache);
     char db[512];
-    snprintf(db, sizeof(db), "%s/example.db", cache);
+    snprintf(db, sizeof(db), "%s/cbm.zova", cache);
     write_test_file(db, "");
 
     const char *old_home = getenv("HOME");
@@ -2059,7 +2059,7 @@ TEST(cli_detect_agents_finds_zed) {
 
     char dir[512];
 #ifdef __APPLE__
-    snprintf(dir, sizeof(dir), "%s/Library/Application Support/Zed", tmpdir);
+    snprintf(dir, sizeof(dir), "%s/.config/zed", tmpdir);
 #elif defined(_WIN32)
     snprintf(dir, sizeof(dir), "%s/AppData/Local/Zed", tmpdir);
 #else

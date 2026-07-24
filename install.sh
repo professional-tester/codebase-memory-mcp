@@ -24,6 +24,17 @@ SKIP_CONFIG=false
 REPLACE=false
 REPLACE_CONFIG=false
 CBM_DOWNLOAD_URL="${CBM_DOWNLOAD_URL:-https://github.com/${REPO}/releases/latest/download}"
+LOCAL_BINARY=""
+
+# Release archives ship this installer beside the binary. Prefer that exact
+# binary when available so an explicitly downloaded version is installed
+# offline instead of silently resolving "latest" again.
+if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
+    SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+    if [ -f "$SCRIPT_DIR/codebase-memory-mcp" ]; then
+        LOCAL_BINARY="$SCRIPT_DIR/codebase-memory-mcp"
+    fi
+fi
 
 # Security: reject non-HTTPS download URLs (defense-in-depth)
 case "$CBM_DOWNLOAD_URL" in
@@ -128,66 +139,75 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "Downloading ${ARCHIVE}..."
-if command -v curl &>/dev/null; then
-    curl -fSL --progress-bar -o "$DLDIR/$ARCHIVE" "$URL"
-elif command -v wget &>/dev/null; then
-    wget -q --show-progress -O "$DLDIR/$ARCHIVE" "$URL"
-else
-    echo "error: curl or wget required" >&2
-    exit 1
-fi
-
-# Checksum verification
-CHECKSUM_URL="${CBM_DOWNLOAD_URL}/checksums.txt"
-if curl -fsSL -o "$DLDIR/checksums.txt" "$CHECKSUM_URL" 2>/dev/null; then
-    EXPECTED=$(grep "$ARCHIVE" "$DLDIR/checksums.txt" | awk '{print $1}')
-    if [ -n "$EXPECTED" ]; then
-        if command -v sha256sum &>/dev/null; then
-            ACTUAL=$(sha256sum "$DLDIR/$ARCHIVE" | awk '{print $1}')
-        elif command -v shasum &>/dev/null; then
-            ACTUAL=$(shasum -a 256 "$DLDIR/$ARCHIVE" | awk '{print $1}')
-        else
-            ACTUAL=""
-        fi
-        if [ -n "$ACTUAL" ] && [ "$EXPECTED" != "$ACTUAL" ]; then
-            echo "error: CHECKSUM MISMATCH — download may be corrupted!" >&2
-            echo "  expected: $EXPECTED" >&2
-            echo "  actual:   $ACTUAL" >&2
-            exit 1
-        elif [ -n "$ACTUAL" ]; then
-            echo "Checksum verified."
-        fi
+download_file() {
+    local url=$1 output=$2
+    if command -v curl &>/dev/null; then
+        curl -fSL --progress-bar -o "$output" "$url"
+    elif command -v wget &>/dev/null; then
+        wget -q --show-progress -O "$output" "$url"
+    else
+        echo "error: curl or wget required" >&2
+        return 1
     fi
-fi
+}
 
-# Extract
-echo "Extracting..."
-cd "$DLDIR"
-if [ "$EXT" = "zip" ]; then
-    unzip -q "$ARCHIVE"
+if [ -n "$LOCAL_BINARY" ]; then
+    echo "Using bundled binary: $LOCAL_BINARY"
+    DLBIN="$LOCAL_BINARY"
 else
-    tar -xzf "$ARCHIVE"
+    echo "Downloading ${ARCHIVE}..."
+    download_file "$URL" "$DLDIR/$ARCHIVE"
+
+    # Network installs fail closed: the release must publish a checksum entry
+    # and the host must provide a SHA-256 implementation.
+    CHECKSUM_URL="${CBM_DOWNLOAD_URL}/checksums.txt"
+    if ! download_file "$CHECKSUM_URL" "$DLDIR/checksums.txt" >/dev/null 2>&1; then
+        echo "error: could not download checksums.txt; refusing unverified install" >&2
+        exit 1
+    fi
+    EXPECTED=$(awk -v name="$ARCHIVE" '$2 == name || $2 == "*" name { print $1; exit }' \
+        "$DLDIR/checksums.txt")
+    if [ -z "$EXPECTED" ]; then
+        echo "error: checksums.txt has no entry for $ARCHIVE" >&2
+        exit 1
+    fi
+    if command -v sha256sum &>/dev/null; then
+        ACTUAL=$(sha256sum "$DLDIR/$ARCHIVE" | awk '{print $1}')
+    elif command -v shasum &>/dev/null; then
+        ACTUAL=$(shasum -a 256 "$DLDIR/$ARCHIVE" | awk '{print $1}')
+    else
+        echo "error: sha256sum or shasum required to verify the release" >&2
+        exit 1
+    fi
+    if [ "$EXPECTED" != "$ACTUAL" ]; then
+        echo "error: CHECKSUM MISMATCH — download may be corrupted!" >&2
+        echo "  expected: $EXPECTED" >&2
+        echo "  actual:   $ACTUAL" >&2
+        exit 1
+    fi
+    echo "Checksum verified."
+
+    echo "Extracting..."
+    if [ "$EXT" = "zip" ]; then
+        unzip -q "$DLDIR/$ARCHIVE" -d "$DLDIR"
+    else
+        tar -xzf "$DLDIR/$ARCHIVE" -C "$DLDIR"
+    fi
+    DLBIN="$DLDIR/codebase-memory-mcp"
 fi
 
-DLBIN="$DLDIR/codebase-memory-mcp"
 if [ ! -f "$DLBIN" ]; then
     echo "error: binary not found after extraction" >&2
     exit 1
 fi
 
-# macOS: fix signing
-if [ "$OS" = "darwin" ]; then
-    echo "Fixing macOS code signing..."
-    xattr -d com.apple.quarantine "$DLBIN" 2>/dev/null || true
-    codesign --sign - --force "$DLBIN" 2>/dev/null || true
-fi
-
-# Install. Identical binaries are a true no-op. A different target is never
-# replaced unless the caller explicitly requested it.
+# Install. An identical binary skips replacement but still repairs agent
+# configuration and PATH. A different target is never replaced unless the
+# caller explicitly requested it.
 mkdir -p "$INSTALL_DIR"
 DEST="$INSTALL_DIR/codebase-memory-mcp"
 HASH_RECORD="$DEST.sha256"
+ALREADY_INSTALLED=false
 hash_file() {
     if command -v sha256sum >/dev/null 2>&1; then
         sha256sum "$1" | awk '{print $1}'
@@ -202,42 +222,60 @@ hash_file() {
 if [ -f "$DEST" ]; then
     CURRENT_HASH=$(hash_file "$DEST")
     INCOMING_HASH=$(hash_file "$DLBIN")
-    RECORDED_HASH=""
-    [ ! -f "$HASH_RECORD" ] || IFS= read -r RECORDED_HASH < "$HASH_RECORD"
-    if [ "$CURRENT_HASH" = "$INCOMING_HASH" ] || [ "$RECORDED_HASH" = "$INCOMING_HASH" ]; then
-        echo "already installed: $DEST"
-        exit 0
+    RECORDED_SOURCE_HASH=""
+    RECORDED_INSTALLED_HASH=""
+    if [ -f "$HASH_RECORD" ]; then
+        RECORDED_SOURCE_HASH=$(awk '$1 == "source" { print $2; exit }' "$HASH_RECORD")
+        RECORDED_INSTALLED_HASH=$(awk '$1 == "installed" { print $2; exit }' "$HASH_RECORD")
     fi
-    if [ "$REPLACE" != true ]; then
+    if [ "$CURRENT_HASH" = "$INCOMING_HASH" ] ||
+        { [ "$RECORDED_SOURCE_HASH" = "$INCOMING_HASH" ] &&
+          [ "$RECORDED_INSTALLED_HASH" = "$CURRENT_HASH" ]; }; then
+        echo "already installed: $DEST"
+        ALREADY_INSTALLED=true
+    elif [ "$REPLACE" != true ]; then
         echo "error: a different binary already exists at $DEST" >&2
         echo "Re-run with --replace to replace it explicitly." >&2
         exit 1
     fi
 fi
 
-INSTALL_TMP=$(mktemp "$INSTALL_DIR/.codebase-memory-mcp.install.XXXXXX")
-cp "$DLBIN" "$INSTALL_TMP"
-chmod 755 "$INSTALL_TMP"
+if [ "$ALREADY_INSTALLED" = false ]; then
+    INSTALL_TMP=$(mktemp "$INSTALL_DIR/.codebase-memory-mcp.install.XXXXXX")
+    cp "$DLBIN" "$INSTALL_TMP"
+    chmod 755 "$INSTALL_TMP"
 
-# Verify the temporary binary before the atomic rename.
-VERSION=$("$INSTALL_TMP" --version 2>&1) || {
-    echo "error: installed binary failed to run" >&2
     if [ "$OS" = "darwin" ]; then
-        echo "  try: xattr -cr $DEST && codesign --force --sign - $DEST" >&2
+        echo "Fixing macOS code signing..."
+        xattr -d com.apple.quarantine "$INSTALL_TMP" 2>/dev/null || true
+        codesign --sign - --force "$INSTALL_TMP" 2>/dev/null || true
     fi
-    exit 1
-}
-if [ -e "$DEST" ] && [ "$REPLACE" != true ]; then
-    echo "error: install target appeared while installing: $DEST" >&2
-    exit 1
+
+    # Verify the temporary binary before the atomic rename.
+    VERSION=$("$INSTALL_TMP" --version 2>&1) || {
+        echo "error: installed binary failed to run" >&2
+        if [ "$OS" = "darwin" ]; then
+            echo "  try: xattr -cr $DEST && codesign --force --sign - $DEST" >&2
+        fi
+        exit 1
+    }
+    if [ -e "$DEST" ] && [ "$REPLACE" != true ]; then
+        echo "error: install target appeared while installing: $DEST" >&2
+        exit 1
+    fi
+    mv -f "$INSTALL_TMP" "$DEST"
+    INSTALL_TMP=""
+    HASH_TMP=$(mktemp "$INSTALL_DIR/.codebase-memory-mcp.sha256.XXXXXX")
+    printf 'source %s\ninstalled %s\n' "$(hash_file "$DLBIN")" "$(hash_file "$DEST")" > "$HASH_TMP"
+    mv -f "$HASH_TMP" "$HASH_RECORD"
+    HASH_TMP=""
+    echo "Installed: $VERSION"
+else
+    VERSION=$("$DEST" --version 2>&1) || {
+        echo "error: installed binary failed to run" >&2
+        exit 1
+    }
 fi
-mv -f "$INSTALL_TMP" "$DEST"
-INSTALL_TMP=""
-HASH_TMP=$(mktemp "$INSTALL_DIR/.codebase-memory-mcp.sha256.XXXXXX")
-printf '%s\n' "$(hash_file "$DLBIN")" > "$HASH_TMP"
-mv -f "$HASH_TMP" "$HASH_RECORD"
-HASH_TMP=""
-echo "Installed: $VERSION"
 
 # Configure agents
 if [ "$SKIP_CONFIG" = true ]; then
@@ -248,6 +286,7 @@ else
     echo "Configuring coding agents..."
     CONFIG_ARGS=(install -y)
     [ "$REPLACE_CONFIG" != true ] || CONFIG_ARGS+=(--replace-config)
+    [ "$VARIANT" != "ui" ] || CONFIG_ARGS+=(--ui)
     "$DEST" "${CONFIG_ARGS[@]}" 2>&1 || {
         echo ""
         echo "error: agent configuration was not changed." >&2

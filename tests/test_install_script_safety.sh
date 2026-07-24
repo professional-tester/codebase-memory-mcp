@@ -24,13 +24,24 @@ esac
 PORTABLE=""
 [[ "$OS" == linux ]] && PORTABLE="-portable"
 ARCHIVE="codebase-memory-mcp-${OS}-${ARCH}${PORTABLE}.tar.gz"
+UI_ARCHIVE="codebase-memory-mcp-ui-${OS}-${ARCH}${PORTABLE}.tar.gz"
 
 make_release() {
     local marker=$1 stage="$TMP_ROOT/stage"
     rm -rf "$stage"
     mkdir -p "$stage"
-    printf '#!/bin/sh\nprintf "codebase-memory-mcp %s\\n"\n' "$marker" \
-        > "$stage/codebase-memory-mcp"
+    cat > "$stage/codebase-memory-mcp" <<SH
+#!/bin/sh
+if [ "\${1:-}" = "--version" ]; then
+    printf 'codebase-memory-mcp %s\\n' "$marker"
+    exit 0
+fi
+if [ "\${1:-}" = "install" ]; then
+    printf '%s\\n' "\$*" >> "\${FAKE_INSTALL_LOG:?}"
+    exit 0
+fi
+exit 0
+SH
     chmod 755 "$stage/codebase-memory-mcp"
     tar -czf "$RELEASE_DIR/$ARCHIVE" -C "$stage" codebase-memory-mcp
     if command -v sha256sum >/dev/null 2>&1; then
@@ -83,7 +94,88 @@ PATH="$FAKE_BIN_DIR:$PATH" CBM_DOWNLOAD_URL=http://localhost/releases \
 grep -q "two" <("$INSTALL_DIR/codebase-memory-mcp" --version)
 [[ ! -e "$INSTALL_DIR/codebase-memory-mcp.old" ]]
 
+# Re-running an identical install must still repair/configure agent entries.
+INSTALL_LOG="$TMP_ROOT/install-args.log"
+: > "$INSTALL_LOG"
+HOME="$HOME_DIR" FAKE_RELEASE_DIR="$RELEASE_DIR" FAKE_INSTALL_LOG="$INSTALL_LOG" \
+PATH="$FAKE_BIN_DIR:$PATH" CBM_DOWNLOAD_URL=http://localhost/releases \
+    "$ROOT/install.sh"
+grep -qx 'install -y' "$INSTALL_LOG"
+
+# The UI variant must enable UI mode in the compiled installer.
+cp "$RELEASE_DIR/$ARCHIVE" "$RELEASE_DIR/$UI_ARCHIVE"
+if command -v sha256sum >/dev/null 2>&1; then
+    UI_HASH=$(sha256sum "$RELEASE_DIR/$UI_ARCHIVE" | awk '{print $1}')
+else
+    UI_HASH=$(shasum -a 256 "$RELEASE_DIR/$UI_ARCHIVE" | awk '{print $1}')
+fi
+printf '%s  %s\n' "$UI_HASH" "$UI_ARCHIVE" >> "$RELEASE_DIR/checksums.txt"
+: > "$INSTALL_LOG"
+HOME="$HOME_DIR" FAKE_RELEASE_DIR="$RELEASE_DIR" FAKE_INSTALL_LOG="$INSTALL_LOG" \
+PATH="$FAKE_BIN_DIR:$PATH" CBM_DOWNLOAD_URL=http://localhost/releases \
+    "$ROOT/install.sh" --ui
+grep -qx 'install -y --ui' "$INSTALL_LOG"
+
+# A source-hash receipt must not hide later modification of the installed file.
+printf '%s\n' tampered >> "$INSTALL_DIR/codebase-memory-mcp"
+if HOME="$HOME_DIR" FAKE_RELEASE_DIR="$RELEASE_DIR" \
+PATH="$FAKE_BIN_DIR:$PATH" CBM_DOWNLOAD_URL=http://localhost/releases \
+    "$ROOT/install.sh" --skip-config >/dev/null 2>&1; then
+    echo "error: installer trusted a modified installed binary" >&2
+    exit 1
+fi
+HOME="$HOME_DIR" FAKE_RELEASE_DIR="$RELEASE_DIR" \
+PATH="$FAKE_BIN_DIR:$PATH" CBM_DOWNLOAD_URL=http://localhost/releases \
+    "$ROOT/install.sh" --skip-config --replace >/dev/null
+
+# An installer shipped inside a release archive must use its adjacent binary
+# instead of downloading "latest" again.
+LOCAL_RELEASE="$TMP_ROOT/local-release"
+LOCAL_HOME="$TMP_ROOT/local-home"
+mkdir -p "$LOCAL_RELEASE" "$LOCAL_HOME"
+cp "$ROOT/install.sh" "$LOCAL_RELEASE/install.sh"
+cp "$TMP_ROOT/stage/codebase-memory-mcp" "$LOCAL_RELEASE/codebase-memory-mcp"
+chmod 755 "$LOCAL_RELEASE/install.sh" "$LOCAL_RELEASE/codebase-memory-mcp"
+HOME="$LOCAL_HOME" FAKE_INSTALL_LOG="$INSTALL_LOG" PATH="$FAKE_BIN_DIR:$PATH" \
+CBM_DOWNLOAD_URL=http://localhost/must-not-download \
+    "$LOCAL_RELEASE/install.sh" --skip-config
+test -x "$LOCAL_HOME/.local/bin/codebase-memory-mcp"
+
+# A network install without a checksum file must fail closed.
+NO_HASH_RELEASE="$TMP_ROOT/no-hash-release"
+NO_HASH_HOME="$TMP_ROOT/no-hash-home"
+mkdir -p "$NO_HASH_RELEASE" "$NO_HASH_HOME"
+cp "$RELEASE_DIR/$ARCHIVE" "$NO_HASH_RELEASE/$ARCHIVE"
+if HOME="$NO_HASH_HOME" FAKE_RELEASE_DIR="$NO_HASH_RELEASE" \
+PATH="$FAKE_BIN_DIR:$PATH" CBM_DOWNLOAD_URL=http://localhost/releases \
+    "$ROOT/install.sh" --skip-config >/dev/null 2>&1; then
+    echo "error: installer accepted a release without checksums.txt" >&2
+    exit 1
+fi
+
 grep -q 'REPO="0ctacity/codebase-memory-mcp"' "$ROOT/install.sh"
 grep -q '\$Repo = "0ctacity/codebase-memory-mcp"' "$ROOT/install.ps1"
+grep -q '\$AlreadyInstalled = \$true' "$ROOT/install.ps1"
+grep -q '\$ConfigArgs += "--ui"' "$ROOT/install.ps1"
+grep -q '\$PSScriptRoot' "$ROOT/install.ps1"
+grep -q 'canonical install.sh' "$ROOT/scripts/setup.sh"
+grep -q 'canonical install.ps1' "$ROOT/scripts/setup-windows.ps1"
+if grep -q 'Go 1\.23\\|CGO\\|Configure Claude Code' \
+    "$ROOT/scripts/setup.sh" "$ROOT/scripts/setup-windows.ps1"; then
+    echo "error: deprecated setup wrappers still contain original-CBM installation logic" >&2
+    exit 1
+fi
+if grep -q -- 'printf("  --reset-indexes\\|if (update_clear_indexes(home' \
+    "$ROOT/src/cli/cli.c"; then
+    echo "error: install/update still expose legacy per-project index deletion" >&2
+    exit 1
+fi
+grep -q '"  database: {s}' "$ROOT/src/cli_zig/cbm_cli_zig.zig"
+grep -q '"database: {s}' "$ROOT/src/cli_zig/cbm_cli_zig.zig"
+if grep -q 'project databases\\|project_databases' \
+    "$ROOT/src/cli/cli.c" "$ROOT/src/cli_zig/cbm_cli_zig.zig"; then
+    echo "error: installer diagnostics still describe per-project databases" >&2
+    exit 1
+fi
 
 echo "installer safety test passed"

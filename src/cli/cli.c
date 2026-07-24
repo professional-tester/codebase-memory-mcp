@@ -1189,7 +1189,7 @@ cbm_detected_agents_t cbm_detect_agents(const char *home_dir) {
     agents.gemini = dir_exists(path);
 
 #ifdef __APPLE__
-    snprintf(path, sizeof(path), "%s/Library/Application Support/Zed", home_dir);
+    snprintf(path, sizeof(path), "%s/.config/zed", home_dir);
 #elif defined(_WIN32)
     snprintf(path, sizeof(path), "%s/AppData/Local/Zed", home_dir);
 #else
@@ -4009,7 +4009,7 @@ static void install_editor_agent_configs(const cbm_detected_agents_t *agents, co
     if (agents->zed) {
         char cp[CLI_BUF_1K];
 #ifdef __APPLE__
-        snprintf(cp, sizeof(cp), "%s/Library/Application Support/Zed/settings.json", home);
+        snprintf(cp, sizeof(cp), "%s/.config/zed/settings.json", home);
 #elif defined(_WIN32)
         snprintf(cp, sizeof(cp), "%s/Zed/settings.json", cbm_app_local_dir());
 #else
@@ -4243,41 +4243,6 @@ static int cbm_sb_append(char **buf, size_t *len, size_t *cap, const char *fmt, 
     return 0;
 }
 
-static bool cbm_project_dbish_name(const char *name) {
-    size_t len = strlen(name);
-    if (name[0] == '_') {
-        return false;
-    }
-    return (len > DB_EXT_LEN && strcmp(name + len - DB_EXT_LEN, ".db") == 0) ||
-           (len > 5 && strcmp(name + len - 5, ".zova") == 0);
-}
-
-static char *cbm_collect_project_db_paths(const char *cache_dir) {
-    char *out = NULL;
-    size_t len = 0;
-    size_t cap = 0;
-    if (cbm_sb_append(&out, &len, &cap, "%s", "") != 0) {
-        return NULL;
-    }
-    if (!cache_dir || !cache_dir[0]) {
-        return out;
-    }
-    cbm_dir_t *d = cbm_opendir(cache_dir);
-    if (!d) {
-        return out;
-    }
-    cbm_dirent_t *ent;
-    while ((ent = cbm_readdir(d)) != NULL) {
-        if (cbm_project_dbish_name(ent->name)) {
-            if (cbm_sb_append(&out, &len, &cap, "%s/%s\n", cache_dir, ent->name) != 0) {
-                break;
-            }
-        }
-    }
-    cbm_closedir(d);
-    return out;
-}
-
 static void cbm_detected_agents_csv(const cbm_detected_agents_t *det, char *buf, size_t buf_sz) {
     buf[0] = '\0';
     struct {
@@ -4345,7 +4310,7 @@ static char *cbm_collect_report_config_paths(const char *home) {
     snprintf(path, sizeof(path), "%s/.codex/AGENTS.md", home);
     cbm_sb_append(&out, &len, &cap, "%s\n", path);
 #ifdef __APPLE__
-    snprintf(path, sizeof(path), "%s/Library/Application Support/Zed/settings.json", home);
+    snprintf(path, sizeof(path), "%s/.config/zed/settings.json", home);
 #elif defined(_WIN32)
     snprintf(path, sizeof(path), "%s/Zed/settings.json", cbm_app_local_dir());
 #else
@@ -4483,7 +4448,6 @@ static void cbm_print_install_help(void) {
     printf("  --replace        Replace an existing installed binary without prompting\n");
     printf("  --force          Legacy alias for --replace; also refresh installed skills\n");
     printf("  --replace-config Replace existing MCP entries that point to another binary\n");
-    printf("  --reset-indexes  Prompt to delete existing project indexes before install\n");
     printf("  --ui             Install/configure UI mode; requires a binary with embedded UI assets\n");
     printf("  -y, --yes        Answer yes to prompts\n");
     printf("  -n, --no         Answer no to prompts\n");
@@ -4502,7 +4466,6 @@ int cbm_cmd_install(int argc, char **argv) {
     bool replace_binary = false;
     bool replace_config = false;
     bool plan = false;
-    bool reset_indexes = false;
     bool install_ui = false;
     for (int i = 0; i < argc; i++) {
         if (strcmp(argv[i], "--dry-run") == 0) {
@@ -4529,11 +4492,6 @@ int cbm_cmd_install(int argc, char **argv) {
                           "error: install uses --ui to select the UI-capable install path; "
                           "runtime UI toggles use --ui=true or --ui=false.\n");
             return CLI_TRUE;
-        }
-        /* Opt-in: delete existing indexes during install. Default preserves
-         * the indexed graph (#607). Only this flag triggers deletion. */
-        if (strcmp(argv[i], "--reset-indexes") == 0) {
-            reset_indexes = true;
         }
     }
 
@@ -4569,14 +4527,7 @@ int cbm_cmd_install(int argc, char **argv) {
 
     printf("codebase-memory-mcp install %s\n\n", CBM_VERSION);
 
-    /* (#607) Default: preserve existing indexes. `--reset-indexes` opts into
-     * the old prompt-and-delete behaviour. The helper returns 0 only when the
-     * user declines the reset prompt, in which case we abort the install. */
-    if (cbm_install_handle_existing_indexes(home, reset_indexes, dry_run) == 0) {
-        return CLI_TRUE;
-    }
-
-    /* Step 1b: Kill running MCP server instances so agents pick up new config */
+    /* Step 1: Kill running MCP server instances so agents pick up new config */
     if (!dry_run) {
         int killed = cbm_kill_other_instances();
         if (killed > 0) {
@@ -4687,13 +4638,13 @@ int cbm_cmd_install(int argc, char **argv) {
 
 static void cbm_print_doctor_help(void) {
     printf("Usage: codebase-memory-mcp doctor\n\n");
-    printf("Reports binary path, cache directory, project DB files, detected agents,\n");
+    printf("Reports binary path, shared Zova database, detected agents,\n");
     printf("config paths, UI capability, UI config, and PATH status. Makes no changes.\n");
 }
 
 static void cbm_print_where_help(void) {
     printf("Usage: codebase-memory-mcp where\n\n");
-    printf("Prints cache, binary, project DB, and config paths. Makes no changes.\n");
+    printf("Prints cache, binary, shared Zova database, and config paths. Makes no changes.\n");
 }
 
 static int cbm_report_paths_common(bool terse) {
@@ -4712,10 +4663,11 @@ static int cbm_report_paths_common(bool terse) {
     if (!cache_dir) {
         cache_dir = "";
     }
-    char *project_dbs = cbm_collect_project_db_paths(cache_dir);
+    char database_path[CLI_BUF_1K];
+    snprintf(database_path, sizeof(database_path), "%s%s%s", cache_dir,
+             cache_dir[0] ? "/" : "", "cbm.zova");
     char *config_paths = cbm_collect_report_config_paths(home);
-    if (!project_dbs || !config_paths) {
-        free(project_dbs);
+    if (!config_paths) {
         free(config_paths);
         (void)fprintf(stderr, "error: failed to build report\n");
         return CLI_TRUE;
@@ -4723,7 +4675,8 @@ static int cbm_report_paths_common(bool terse) {
 
     char *report = NULL;
     if (terse) {
-        report = cbm_cli_zig_where_report(running, installed, cache_dir, project_dbs, config_paths);
+        report =
+            cbm_cli_zig_where_report(running, installed, cache_dir, database_path, config_paths);
     } else {
         cbm_detected_agents_t det = cbm_detect_agents(home);
         char agents[CLI_BUF_512];
@@ -4732,13 +4685,12 @@ static int cbm_report_paths_common(bool terse) {
         snprintf(bin_dir, sizeof(bin_dir), "%s/.local/bin", home);
         cbm_ui_config_t ui_cfg;
         cbm_ui_config_load(&ui_cfg);
-        report = cbm_cli_zig_doctor_report(home, running, installed, cache_dir, project_dbs,
+        report = cbm_cli_zig_doctor_report(home, running, installed, cache_dir, database_path,
                                            config_paths, agents, cbm_path_contains_dir(bin_dir),
                                            CBM_EMBEDDED_FILE_COUNT > 0, ui_cfg.ui_enabled,
                                            ui_cfg.ui_port);
     }
 
-    free(project_dbs);
     free(config_paths);
     if (!report) {
         (void)fprintf(stderr, "error: failed to build report\n");
@@ -4898,7 +4850,7 @@ static void uninstall_editor_agents(const cbm_detected_agents_t *agents, const c
     if (agents->zed) {
         char cp[CLI_BUF_1K];
 #ifdef __APPLE__
-        snprintf(cp, sizeof(cp), "%s/Library/Application Support/Zed/settings.json", home);
+        snprintf(cp, sizeof(cp), "%s/.config/zed/settings.json", home);
 #elif defined(_WIN32)
         snprintf(cp, sizeof(cp), "%s/Zed/settings.json", cbm_app_local_dir());
 #else
@@ -5104,28 +5056,6 @@ static void build_update_url(char *url, int url_sz, const char *os, const char *
              arch, portable, ext);
 }
 
-/* Prompt to delete existing indexes. Returns 0 to continue, 1 to abort. */
-static int update_clear_indexes(const char *home, bool dry_run) {
-    int index_count = count_db_indexes(home);
-    if (index_count == 0) {
-        return 0;
-    }
-    printf("Found %d existing index(es) that must be rebuilt after update:\n", index_count);
-    cbm_list_indexes(home);
-    printf("\n");
-    if (dry_run) {
-        printf("(dry-run — indexes would be deleted)\n\n");
-        return 0;
-    }
-    if (!prompt_yn("Delete these indexes and continue with update?")) {
-        printf("Update cancelled.\n");
-        return CLI_TRUE;
-    }
-    int removed = cbm_remove_indexes(home);
-    printf("Removed %d index(es).\n\n", removed);
-    return 0;
-}
-
 /* Download, verify checksum, kill old instances, and install binary. Returns 0 on success. */
 static int download_verify_install(const char *url, const char *ext, const char *os,
                                    const char *arch, bool want_ui, const char *bin_dest) {
@@ -5301,12 +5231,8 @@ int cbm_cmd_update(int argc, char **argv) {
         return 0;
     }
 
-    /* Step 1: Check for existing indexes */
-    if (update_clear_indexes(home, dry_run) != 0) {
-        return CLI_TRUE;
-    }
-
-    /* Step 2: Determine variant */
+    /* Step 1: Determine variant. Updating the executable never deletes the
+     * shared Zova database; schema compatibility is handled by the runtime. */
     int want_ui_rc = select_update_variant(variant_flag);
     if (want_ui_rc < 0) {
         return CLI_TRUE;

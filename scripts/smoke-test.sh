@@ -855,7 +855,7 @@ mkdir -p "$FAKE_HOME/.openclaw"
 mkdir -p "$FAKE_HOME/.kilocode/rules"
 mkdir -p "$FAKE_HOME/.config/opencode"
 if [ "$(uname -s)" = "Darwin" ]; then
-  mkdir -p "$FAKE_HOME/Library/Application Support/Zed"
+  mkdir -p "$FAKE_HOME/.config/zed"
   mkdir -p "$FAKE_HOME/Library/Application Support/Code/User"
   mkdir -p "$FAKE_HOME/Library/Application Support/Code/User/globalStorage/kilocode.kilo-code/settings"
 elif [[ "${BINARY:-}" == *.exe ]]; then
@@ -1019,7 +1019,7 @@ echo "OK 8m: Gemini instructions"
 
 # 8n: Zed MCP
 if [ "$(uname -s)" = "Darwin" ]; then
-  ZED_CFG="$FAKE_HOME/Library/Application Support/Zed/settings.json"
+  ZED_CFG="$FAKE_HOME/.config/zed/settings.json"
 elif [[ "$BINARY" == *.exe ]]; then
   ZED_CFG="$FAKE_HOME/AppData/Local/Zed/settings.json"
 else

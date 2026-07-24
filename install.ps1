@@ -71,56 +71,80 @@ if ($Variant -eq "ui") {
 }
 $Url = "$BaseUrl/$Archive"
 
-# Download
-$TmpDir = Join-Path ([System.IO.Path]::GetTempPath()) "cbm-install-$(Get-Random)"
-New-Item -ItemType Directory -Path $TmpDir -Force | Out-Null
-
-Write-Host "Downloading $Archive..."
-try {
-    Invoke-WebRequest -Uri $Url -OutFile "$TmpDir\$Archive" -UseBasicParsing
-} catch {
-    Write-Host "error: download failed: $_" -ForegroundColor Red
-    Remove-Item -Recurse -Force $TmpDir -ErrorAction SilentlyContinue
-    exit 1
+# Release archives include this installer beside the exact binary they were
+# built with. Prefer that binary so an extracted release installs reproducibly
+# and works offline. The one-line installer falls back to the latest release.
+$TmpDir = $null
+$BundledName = if ($Variant -eq "ui") { "codebase-memory-mcp-ui.exe" } else { $BinName }
+$BundledBin = $null
+if ($PSScriptRoot) {
+    $BundledBin = Join-Path $PSScriptRoot $BundledName
+    if (-not (Test-Path $BundledBin) -and $Variant -eq "ui") {
+        $BundledBin = Join-Path $PSScriptRoot $BinName
+    }
 }
 
+if ($BundledBin -and (Test-Path $BundledBin)) {
+    Write-Host "Using bundled binary: $BundledBin"
+    $DlBin = $BundledBin
+} else {
+    $TmpDir = Join-Path ([System.IO.Path]::GetTempPath()) "cbm-install-$(Get-Random)"
+    New-Item -ItemType Directory -Path $TmpDir -Force | Out-Null
 
-# Checksum verification
-$ChecksumUrl = "$BaseUrl/checksums.txt"
-try {
-    Invoke-WebRequest -Uri $ChecksumUrl -OutFile "$TmpDir\checksums.txt" -UseBasicParsing
-    $checksumLine = Get-Content "$TmpDir\checksums.txt" | Where-Object { $_ -like "*$Archive*" }
-    if ($checksumLine) {
-        $expected = ($checksumLine -split '\s+')[0]
-        $actual = (Get-FileHash -Path "$TmpDir\$Archive" -Algorithm SHA256).Hash.ToLower()
-        if ($expected -ne $actual) {
-            Write-Host "error: CHECKSUM MISMATCH!" -ForegroundColor Red
-            Write-Host "  expected: $expected"
-            Write-Host "  actual:   $actual"
-            Remove-Item -Recurse -Force $TmpDir
+    Write-Host "Downloading $Archive..."
+    try {
+        Invoke-WebRequest -Uri $Url -OutFile "$TmpDir\$Archive" -UseBasicParsing
+    } catch {
+        Write-Host "error: download failed: $_" -ForegroundColor Red
+        Remove-Item -Recurse -Force $TmpDir -ErrorAction SilentlyContinue
+        exit 1
+    }
+
+    # Network installs fail closed: an archive without a matching, valid
+    # checksum is not trusted.
+    $ChecksumUrl = "$BaseUrl/checksums.txt"
+    try {
+        Invoke-WebRequest -Uri $ChecksumUrl -OutFile "$TmpDir\checksums.txt" -UseBasicParsing
+    } catch {
+        Write-Host "error: could not download checksums.txt: $_" -ForegroundColor Red
+        Remove-Item -Recurse -Force $TmpDir -ErrorAction SilentlyContinue
+        exit 1
+    }
+    $checksumLine = Get-Content "$TmpDir\checksums.txt" |
+        Where-Object {
+            $fields = $_ -split '\s+', 2
+            $fields.Count -eq 2 -and $fields[1].TrimStart("*") -eq $Archive
+        } |
+        Select-Object -First 1
+    if (-not $checksumLine) {
+        Write-Host "error: checksums.txt has no entry for $Archive" -ForegroundColor Red
+        Remove-Item -Recurse -Force $TmpDir -ErrorAction SilentlyContinue
+        exit 1
+    }
+    $expected = ($checksumLine -split '\s+')[0].ToLower()
+    $actual = (Get-FileHash -Path "$TmpDir\$Archive" -Algorithm SHA256).Hash.ToLower()
+    if ($expected -ne $actual) {
+        Write-Host "error: CHECKSUM MISMATCH!" -ForegroundColor Red
+        Write-Host "  expected: $expected"
+        Write-Host "  actual:   $actual"
+        Remove-Item -Recurse -Force $TmpDir -ErrorAction SilentlyContinue
+        exit 1
+    }
+    Write-Host "Checksum verified."
+
+    Write-Host "Extracting..."
+    Expand-Archive -Path "$TmpDir\$Archive" -DestinationPath $TmpDir -Force
+
+    $DlBin = Join-Path $TmpDir $BinName
+    if (-not (Test-Path $DlBin)) {
+        $UiBin = Join-Path $TmpDir "codebase-memory-mcp-ui.exe"
+        if (Test-Path $UiBin) {
+            $DlBin = $UiBin
+        } else {
+            Write-Host "error: binary not found after extraction" -ForegroundColor Red
+            Remove-Item -Recurse -Force $TmpDir -ErrorAction SilentlyContinue
             exit 1
         }
-        Write-Host "Checksum verified."
-    }
-} catch {
-    Write-Host "warning: could not verify checksum (non-fatal)"
-}
-
-# Extract
-Write-Host "Extracting..."
-Expand-Archive -Path "$TmpDir\$Archive" -DestinationPath $TmpDir -Force
-
-$DlBin = Join-Path $TmpDir $BinName
-if (-not (Test-Path $DlBin)) {
-    # UI variant may have different name in zip
-    $UiBin = Join-Path $TmpDir "codebase-memory-mcp-ui.exe"
-    if (Test-Path $UiBin) {
-        Rename-Item $UiBin $BinName
-        $DlBin = Join-Path $TmpDir $BinName
-    } else {
-        Write-Host "error: binary not found after extraction" -ForegroundColor Red
-        Remove-Item -Recurse -Force $TmpDir
-        exit 1
     }
 }
 
@@ -128,50 +152,51 @@ if (-not (Test-Path $DlBin)) {
 New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
 $Dest = Join-Path $InstallDir $BinName
 
-# Identical binaries are a true no-op. Refuse a different target unless the
-# caller explicitly authorizes replacement.
+$AlreadyInstalled = $false
+# An identical binary needs no replacement, but configuration and PATH repair
+# must still run. Refuse a different target unless replacement was authorized.
 if (Test-Path $Dest) {
     $CurrentHash = (Get-FileHash -Path $Dest -Algorithm SHA256).Hash
     $IncomingHash = (Get-FileHash -Path $DlBin -Algorithm SHA256).Hash
     if ($CurrentHash -eq $IncomingHash) {
         Write-Host "already installed: $Dest"
-        Remove-Item -Recurse -Force $TmpDir -ErrorAction SilentlyContinue
-        exit 0
-    }
-    if (-not $Replace) {
+        $AlreadyInstalled = $true
+    } elseif (-not $Replace) {
         Write-Host "error: a different binary already exists at $Dest" -ForegroundColor Red
         Write-Host "Re-run with --replace to replace it explicitly."
-        Remove-Item -Recurse -Force $TmpDir -ErrorAction SilentlyContinue
+        if ($TmpDir) { Remove-Item -Recurse -Force $TmpDir -ErrorAction SilentlyContinue }
         exit 1
     }
 }
 
-$InstallTmp = Join-Path $InstallDir ".codebase-memory-mcp.install.$([Guid]::NewGuid().ToString('N')).exe"
-Copy-Item $DlBin $InstallTmp
+if (-not $AlreadyInstalled) {
+    $InstallTmp = Join-Path $InstallDir ".codebase-memory-mcp.install.$([Guid]::NewGuid().ToString('N')).exe"
+    Copy-Item $DlBin $InstallTmp
 
-# Verify before atomically moving the binary into place.
-try {
-    $ver = & $InstallTmp --version 2>&1
-} catch {
-    Write-Host "error: installed binary failed to run" -ForegroundColor Red
-    Remove-Item $InstallTmp -Force -ErrorAction SilentlyContinue
-    Remove-Item -Recurse -Force $TmpDir
-    exit 1
+    # Verify before atomically moving the binary into place.
+    try {
+        $ver = & $InstallTmp --version 2>&1
+    } catch {
+        Write-Host "error: installed binary failed to run" -ForegroundColor Red
+        Remove-Item $InstallTmp -Force -ErrorAction SilentlyContinue
+        if ($TmpDir) { Remove-Item -Recurse -Force $TmpDir -ErrorAction SilentlyContinue }
+        exit 1
+    }
+    if ((Test-Path $Dest) -and -not $Replace) {
+        Write-Host "error: install target appeared while installing: $Dest" -ForegroundColor Red
+        Remove-Item $InstallTmp -Force -ErrorAction SilentlyContinue
+        if ($TmpDir) { Remove-Item -Recurse -Force $TmpDir -ErrorAction SilentlyContinue }
+        exit 1
+    }
+    try {
+        Move-Item $InstallTmp $Dest -Force
+    } catch {
+        Remove-Item $InstallTmp -Force -ErrorAction SilentlyContinue
+        if ($TmpDir) { Remove-Item -Recurse -Force $TmpDir -ErrorAction SilentlyContinue }
+        throw
+    }
+    Write-Host "Installed: $ver"
 }
-if ((Test-Path $Dest) -and -not $Replace) {
-    Write-Host "error: install target appeared while installing: $Dest" -ForegroundColor Red
-    Remove-Item $InstallTmp -Force -ErrorAction SilentlyContinue
-    Remove-Item -Recurse -Force $TmpDir
-    exit 1
-}
-try {
-    Move-Item $InstallTmp $Dest -Force
-} catch {
-    Remove-Item $InstallTmp -Force -ErrorAction SilentlyContinue
-    Remove-Item -Recurse -Force $TmpDir -ErrorAction SilentlyContinue
-    throw
-}
-Write-Host "Installed: $ver"
 
 # Configure agents
 if ($SkipConfig) {
@@ -181,6 +206,7 @@ if ($SkipConfig) {
     Write-Host ""
     Write-Host "Configuring coding agents..."
     $ConfigArgs = @("install", "-y")
+    if ($Variant -eq "ui") { $ConfigArgs += "--ui" }
     if ($ReplaceConfig) { $ConfigArgs += "--replace-config" }
     & $Dest @ConfigArgs 2>&1 | Write-Host
     if ($LASTEXITCODE -ne 0) {
@@ -201,7 +227,7 @@ if ($UserPath -notlike "*$InstallDir*") {
 }
 
 # Cleanup
-Remove-Item -Recurse -Force $TmpDir -ErrorAction SilentlyContinue
+if ($TmpDir) { Remove-Item -Recurse -Force $TmpDir -ErrorAction SilentlyContinue }
 
 Write-Host ""
 Write-Host "Done! Restart your terminal and coding agent to start using codebase-memory-mcp."

@@ -49,7 +49,8 @@ SH
     else
         HASH=$(shasum -a 256 "$RELEASE_DIR/$ARCHIVE" | awk '{print $1}')
     fi
-    printf '%s  %s\n' "$HASH" "$ARCHIVE" > "$RELEASE_DIR/checksums.txt"
+    # Match the release workflow's `sha256sum ./archive` output exactly.
+    printf '%s  ./%s\n' "$HASH" "$ARCHIVE" > "$RELEASE_DIR/checksums.txt"
 }
 
 cat > "$FAKE_BIN_DIR/curl" <<'SH'
@@ -109,7 +110,7 @@ if command -v sha256sum >/dev/null 2>&1; then
 else
     UI_HASH=$(shasum -a 256 "$RELEASE_DIR/$UI_ARCHIVE" | awk '{print $1}')
 fi
-printf '%s  %s\n' "$UI_HASH" "$UI_ARCHIVE" >> "$RELEASE_DIR/checksums.txt"
+printf '%s  ./%s\n' "$UI_HASH" "$UI_ARCHIVE" >> "$RELEASE_DIR/checksums.txt"
 : > "$INSTALL_LOG"
 HOME="$HOME_DIR" FAKE_RELEASE_DIR="$RELEASE_DIR" FAKE_INSTALL_LOG="$INSTALL_LOG" \
 PATH="$FAKE_BIN_DIR:$PATH" CBM_DOWNLOAD_URL=http://localhost/releases \

@@ -165,8 +165,14 @@ else
         echo "error: could not download checksums.txt; refusing unverified install" >&2
         exit 1
     fi
-    EXPECTED=$(awk -v name="$ARCHIVE" '$2 == name || $2 == "*" name { print $1; exit }' \
-        "$DLDIR/checksums.txt")
+    EXPECTED=$(awk -v name="$ARCHIVE" '
+        {
+            file = $2
+            sub(/^\*/, "", file)
+            sub(/^\.\//, "", file)
+            if (file == name) { print $1; exit }
+        }
+    ' "$DLDIR/checksums.txt")
     if [ -z "$EXPECTED" ]; then
         echo "error: checksums.txt has no entry for $ARCHIVE" >&2
         exit 1

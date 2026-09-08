@@ -12,6 +12,18 @@
 #define MAX_NODE_POOL_SIZE 50
 #define MAX_ITERATOR_COUNT 64
 
+// CBM patch (upstream da046da5, #9): cap the recursive ambiguity-merge in
+// stack_node_add_link. On a deeply ambiguous parse (e.g. Perl's optional-paren
+// function calls in a f(f(f(...))) chain ~30k deep), the "merge them
+// recursively" path below recurses once per nesting level on the C stack,
+// overflowing the small default thread stack on Windows (~1 MB) and even the
+// 8 MB POSIX stack at extreme depth — a SIGSEGV during ts_parser_parse,
+// before any language extractor runs. Past this cap we stop eagerly merging
+// and leave the ambiguity on the GLR stack, exactly as the existing
+// `self->link_count == MAX_LINK_COUNT` bail-out already does: the parse still
+// produces a valid tree (graceful degradation), never a wrong one.
+#define CBM_TS_STACK_MERGE_MAX_DEPTH 512
+
 #if defined _WIN32 && !defined __GNUC__
 #define forceinline __forceinline
 #else
@@ -197,10 +209,15 @@ static bool stack__subtree_is_equivalent(Subtree left, Subtree right) {
   );
 }
 
-static void stack_node_add_link(
+// CBM patch: depth-tracked inner worker. `depth` counts the recursive
+// ambiguity-merge nesting; past CBM_TS_STACK_MERGE_MAX_DEPTH we stop merging
+// (see the macro comment). The public stack_node_add_link below is a thin
+// wrapper that seeds depth = 0, so all existing call sites are unchanged.
+static void stack_node_add_link_inner(
   StackNode *self,
   StackLink link,
-  SubtreePool *subtree_pool
+  SubtreePool *subtree_pool,
+  unsigned depth
 ) {
   if (link.node == self) return;
 
@@ -231,8 +248,12 @@ static void stack_node_add_link(
         existing_link->node->position.bytes == link.node->position.bytes &&
         existing_link->node->error_cost == link.node->error_cost
       ) {
-        for (int j = 0; j < link.node->link_count; j++) {
-          stack_node_add_link(existing_link->node, link.node->links[j], subtree_pool);
+        // CBM patch: bound the recursive merge to keep the C stack finite.
+        if (depth < CBM_TS_STACK_MERGE_MAX_DEPTH) {
+          for (int j = 0; j < link.node->link_count; j++) {
+            stack_node_add_link_inner(existing_link->node, link.node->links[j],
+                                      subtree_pool, depth + 1);
+          }
         }
         int32_t dynamic_precedence = link.node->dynamic_precedence;
         if (link.subtree.ptr) {
@@ -261,6 +282,15 @@ static void stack_node_add_link(
 
   if (node_count > self->node_count) self->node_count = node_count;
   if (dynamic_precedence > self->dynamic_precedence) self->dynamic_precedence = dynamic_precedence;
+}
+
+// CBM patch: public entry point — unchanged signature, seeds recursion depth.
+static void stack_node_add_link(
+  StackNode *self,
+  StackLink link,
+  SubtreePool *subtree_pool
+) {
+  stack_node_add_link_inner(self, link, subtree_pool, 0);
 }
 
 static void stack_head_delete(

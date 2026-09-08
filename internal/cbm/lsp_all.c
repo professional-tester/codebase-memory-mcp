@@ -1,6 +1,11 @@
 // lsp_all.c — Compilation unit for all LSP type resolver source files.
 // CGo only compiles .c files in the package directory, not subdirectories.
 // This file includes all LSP sources so they compile as part of the cbm package.
+//
+// NOTE (v1.0.2 #9): the build cache keys on THIS file's content, not on the
+// nested #includes below. Bump CBM_LSP_ALL_REV when changing any nested
+// lsp/*.c file so test/production builds pick it up.
+#define CBM_LSP_ALL_REV 2
 
 #include "lsp/type_rep.c"
 #include "lsp/scope.c"

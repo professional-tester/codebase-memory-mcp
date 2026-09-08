@@ -11,6 +11,7 @@
  */
 #include "test_framework.h"
 #include "cbm.h"
+#include "lang_specs.h" /* cbm_ts_language — direct-parse GLR cap regression */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -440,6 +441,53 @@ static bool so_extract_crashes(const char *content, CBMLanguage lang, const char
 #endif
 }
 
+/* Parse `content` with tree-sitter DIRECTLY in a forked child, returning true
+ * if the child died by signal. This is the crash-isolating regression for the
+ * vendored GLR stack-merge recursion cap (CBM_TS_STACK_MERGE_MAX_DEPTH,
+ * ts_runtime/src/stack.c, upstream da046da5): only a direct parse exercises
+ * the cap. Windows runs in-process (a real crash aborts the runner — a
+ * visible failure), mirroring so_extract_crashes. */
+static bool so_parse_crashes(const char *content, CBMLanguage lang) {
+    const TSLanguage *ts_lang = cbm_ts_language(lang);
+    if (!ts_lang) {
+        return false;
+    }
+#if defined(_WIN32)
+    TSParser *parser = ts_parser_new();
+    if (parser) {
+        ts_parser_set_language(parser, ts_lang);
+        TSTree *tree = ts_parser_parse_string(parser, NULL, content, (uint32_t)strlen(content));
+        if (tree) {
+            ts_tree_delete(tree);
+        }
+        ts_parser_delete(parser);
+    }
+    return false;
+#else
+    fflush(NULL);
+    pid_t pid = fork();
+    if (pid < 0) {
+        return false;
+    }
+    if (pid == 0) {
+        TSParser *parser = ts_parser_new();
+        if (parser) {
+            ts_parser_set_language(parser, ts_lang);
+            TSTree *tree =
+                ts_parser_parse_string(parser, NULL, content, (uint32_t)strlen(content));
+            if (tree) {
+                ts_tree_delete(tree);
+            }
+            ts_parser_delete(parser);
+        }
+        _exit(0);
+    }
+    int status = 0;
+    (void)waitpid(pid, &status, 0);
+    return WIFSIGNALED(status);
+#endif
+}
+
 TEST(lsp_java_deep_nesting_no_crash) {
     /* Deeply nested call expressions — the same shape as the elasticsearch
      * crash (fast SIGSEGV under recursive java_resolve_calls_in_node frames;
@@ -615,6 +663,34 @@ TEST(lsp_php_deep_nesting_no_crash) {
     PASS();
 }
 
+TEST(perl_glr_deep_parse_recursion_capped) {
+    /* Upstream da046da5: parse deeply nested ambiguous Perl f(f(f(...f(1)...)))
+     * DIRECTLY (past any extract-level guard, which would otherwise skip it).
+     * Perl's paren-optional call grammar makes each level ambiguous, so the GLR
+     * parser merges ambiguous parse-stack heads recursively — once per nesting
+     * level — overflowing the native stack during the parse, before any
+     * extraction runs. The CBM_TS_STACK_MERGE_MAX_DEPTH cap stops merging past
+     * the bound (ambiguity left on the GLR stack: a valid parse, never a wrong
+     * one), so the parse returns cleanly instead of crashing. */
+    const int DEPTH = 30000;
+    size_t sz = (size_t)DEPTH * 3 + 256;
+    char *src = malloc(sz);
+    ASSERT_NOT_NULL(src);
+    char *p = src;
+    p += snprintf(p, sz, "sub f { return $_[0]; }\nsub g { return ");
+    for (int i = 0; i < DEPTH; i++) {
+        *p++ = 'f';
+        *p++ = '(';
+    }
+    *p++ = '1';
+    memset(p, ')', DEPTH);
+    p += DEPTH;
+    snprintf(p, sz - (size_t)(p - src), "; }\n");
+    ASSERT_FALSE(so_parse_crashes(src, CBM_LANG_PERL));
+    free(src);
+    PASS();
+}
+
 TEST(lsp_kotlin_deep_nesting_no_crash) {
     /* kt_resolve_calls_in_node recurses per nesting level; Java analog. */
     const int DEPTH = 30000;
@@ -653,6 +729,7 @@ SUITE(stack_overflow) {
     RUN_TEST(lsp_python_deep_nesting_no_crash);
     RUN_TEST(lsp_go_deep_nesting_no_crash);
     RUN_TEST(lsp_php_deep_nesting_no_crash);
+    RUN_TEST(perl_glr_deep_parse_recursion_capped);
     RUN_TEST(lsp_kotlin_deep_nesting_no_crash);
 
     RUN_TEST(js_calls_exceed_512);

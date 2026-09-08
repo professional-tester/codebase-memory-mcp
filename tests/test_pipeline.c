@@ -2231,6 +2231,91 @@ TEST(pipeline_python_cross_module_call) {
     PASS();
 }
 
+/* #725: two same-named symbols across languages must not share CALLS edges.
+ * Python Store.commit is the real callee of save(); the JS Editor.commit
+ * function is a distinct binding and must have no inbound CALLS from Python.
+ * unique_name (candidates==1) is #1572 and is not this claim. */
+TEST(pipeline_cross_language_same_name_does_not_share_calls_issue725) {
+    const char *files[] = {"store.py", "app.py", "web/src/pages/Editor.js"};
+    const char *contents[] = {
+        "class Store:\n"
+        "    def commit(self):\n"
+        "        return True\n",
+
+        "from store import Store\n"
+        "\n"
+        "def save():\n"
+        "    return Store().commit()\n",
+
+        "export function commit() {\n"
+        "  return 1;\n"
+        "}\n"};
+
+    if (setup_lang_repo(files, contents, 3) != 0)
+        FAIL("tmpdir");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+    const char *proj = cbm_pipeline_project_name(p);
+
+    cbm_node_t *commits = NULL;
+    int ncommit = 0;
+    cbm_store_find_nodes_by_name(s, proj, "commit", &commits, &ncommit);
+    ASSERT_GTE(ncommit, 2);
+
+    int64_t js_id = 0;
+    int64_t py_id = 0;
+    for (int i = 0; i < ncommit; i++) {
+        if (commits[i].file_path && strstr(commits[i].file_path, "Editor.js"))
+            js_id = commits[i].id;
+        if (commits[i].file_path && strstr(commits[i].file_path, "store.py"))
+            py_id = commits[i].id;
+    }
+    ASSERT_TRUE(js_id != 0);
+    ASSERT_TRUE(py_id != 0);
+
+    cbm_node_t *saves = NULL;
+    int nsave = 0;
+    cbm_store_find_nodes_by_name(s, proj, "save", &saves, &nsave);
+    ASSERT_GT(nsave, 0);
+
+    cbm_edge_t *from_save = NULL;
+    int nfrom = 0;
+    cbm_store_find_edges_by_source_type(s, saves[0].id, "CALLS", &from_save, &nfrom);
+    bool save_calls_py = false;
+    bool save_calls_js = false;
+    for (int i = 0; i < nfrom; i++) {
+        if (from_save[i].target_id == py_id)
+            save_calls_py = true;
+        if (from_save[i].target_id == js_id)
+            save_calls_js = true;
+    }
+    ASSERT_TRUE(save_calls_py);
+    ASSERT_FALSE(save_calls_js);
+
+    cbm_edge_t *into_js = NULL;
+    int njs = 0;
+    cbm_store_find_edges_by_target_type(s, js_id, "CALLS", &into_js, &njs);
+    ASSERT_EQ(njs, 0);
+
+    if (from_save)
+        cbm_store_free_edges(from_save, nfrom);
+    if (into_js)
+        cbm_store_free_edges(into_js, njs);
+    cbm_store_free_nodes(commits, ncommit);
+    cbm_store_free_nodes(saves, nsave);
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_lang_repo();
+    PASS();
+}
+
 TEST(pipeline_go_type_classification) {
     /* Port of TestGoTypeClassification */
     const char *files[] = {"types.go"};
@@ -8002,6 +8087,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_rust_grouped_import_properties_valid_json_sequential);
     RUN_TEST(pipeline_go_cross_package_call);
     RUN_TEST(pipeline_python_cross_module_call);
+    RUN_TEST(pipeline_cross_language_same_name_does_not_share_calls_issue725);
     RUN_TEST(pipeline_go_type_classification);
     RUN_TEST(pipeline_go_grouped_types);
     RUN_TEST(pipeline_kotlin_project);

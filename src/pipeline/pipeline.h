@@ -19,6 +19,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "cbm.h" /* CBMLanguage for language-scoped suppression helpers */
+
 /* Forward declarations */
 typedef struct cbm_store cbm_store_t;
 typedef struct cbm_gbuf cbm_gbuf_t;
@@ -336,6 +338,16 @@ bool cbm_perl_suppress_generic_match(bool is_perl, bool is_method, const char *c
  * Explicit drop-list keeps every lsp_* / import / same-module / qualified match.
  * Pure; unit-tested in test_registry.c. */
 bool cbm_tsjs_suppress_weak_method_match(bool is_tsjs, bool is_method, const char *strategy);
+
+/* Decide whether to drop a suffix_match CALLS edge when the caller language
+ * and the target file's language disagree (upstream 416ba994/#725): two
+ * same-named symbols in different languages would otherwise collapse onto one
+ * winner (e.g. a Python Store.commit call attached to a JS commit function).
+ * unique_name (candidates == 1) is #1572 and is left alone; same_module /
+ * import_map / lsp_* are kept. JS/TS/TSX are one family. Pure; unit-tested
+ * in test_registry.c. */
+bool cbm_suppress_cross_language_suffix_match(CBMLanguage caller_lang, const char *target_file_path,
+                                              const char *strategy);
 
 /* Get the label of a qualified name, or NULL if not found. */
 const char *cbm_registry_label_of(const cbm_registry_t *r, const char *qn);

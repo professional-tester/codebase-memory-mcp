@@ -6188,6 +6188,56 @@ TEST(index_repository_honors_allowed_root) {
     PASS();
 }
 
+/* #17 boundary semantics (upstream 7fa5b077): cbm_mcp_check_index_root is the
+ * shared entry-point guard behind both the MCP index_repository handler and
+ * the UI POST /api/index route. It must use path-COMPONENT boundaries, so a
+ * sibling prefix (/home/alice-evil vs root /home/alice) and an already-in-root
+ * path are distinguished, and symlink aliases resolve before judging. */
+TEST(index_root_boundary_is_component_aware) {
+    char base[512];
+    snprintf(base, sizeof(base), "%s/cbm_bound_XXXXXX", cbm_tmpdir());
+    if (!cbm_mkdtemp(base)) {
+        FAIL("cbm_mkdtemp(base) failed");
+    }
+    char inside[640];
+    snprintf(inside, sizeof(inside), "%s/inside", base);
+    ASSERT_TRUE(cbm_mkdir_p(inside, 0755));
+    char sibling[640];
+    snprintf(sibling, sizeof(sibling), "%s_evil", base); /* sibling prefix escape */
+    ASSERT_TRUE(cbm_mkdir_p(sibling, 0755));
+
+    /* 1. Allowed root unset => every existing path permitted (default). */
+    char canon[CBM_SZ_4K];
+    const char *reason = NULL;
+    ASSERT_EQ(cbm_mcp_check_index_root(inside, canon, sizeof(canon), &reason), 0);
+    ASSERT_NULL(reason);
+
+    /* 2. Allowed root set, path inside => permitted, canonicalized. */
+    cbm_setenv("CBM_ALLOWED_ROOT", base, 1);
+    reason = NULL;
+    ASSERT_EQ(cbm_mcp_check_index_root(inside, canon, sizeof(canon), &reason), 0);
+    ASSERT_NULL(reason);
+    ASSERT_NOT_NULL(strstr(canon, "/inside"));
+
+    /* 3. Sibling prefix escape => REFUSED: /base_evil is NOT inside /base. */
+    reason = NULL;
+    ASSERT_LT(cbm_mcp_check_index_root(sibling, canon, sizeof(canon), &reason), 0);
+    ASSERT_NOT_NULL(reason);
+    ASSERT_NOT_NULL(strstr(reason, "outside the allowed root"));
+
+    /* 4. A path outside every allowed root => REFUSED (use the temp dir above
+     * base, which is never inside base). */
+    reason = NULL;
+    ASSERT_LT(cbm_mcp_check_index_root(cbm_tmpdir(), canon, sizeof(canon), &reason), 0);
+    ASSERT_NOT_NULL(strstr(reason, "outside the allowed root"));
+
+    cbm_unsetenv("CBM_ALLOWED_ROOT");
+    cbm_rmdir(inside);
+    cbm_rmdir(sibling);
+    cbm_rmdir(base);
+    PASS();
+}
+
 /* ══════════════════════════════════════════════════════════════════
  *  SUITE
  * ══════════════════════════════════════════════════════════════════ */
@@ -6375,6 +6425,7 @@ SUITE(mcp) {
     RUN_TEST(mcp_path_within_root_rejects_escape);
     RUN_TEST(detect_changes_rejects_option_like_base_branch);
     RUN_TEST(index_repository_honors_allowed_root);
+    RUN_TEST(index_root_boundary_is_component_aware);
     /* JSON-RPC parsing */
     RUN_TEST(jsonrpc_parse_request);
     RUN_TEST(jsonrpc_parse_notification);

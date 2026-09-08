@@ -28,6 +28,7 @@
 #endif
 /* pipeline.h no longer needed — indexing runs as subprocess */
 #include "foundation/log.h"
+#include "foundation/constants.h"
 #include "foundation/platform.h"
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
@@ -1174,6 +1175,24 @@ static void handle_index_start(cbm_http_conn_t *c, const cbm_http_req_t *req) {
         cbm_http_replyf(c, 400, g_cors_json, "{\"error\":\"directory not found\"}");
         return;
     }
+
+    /* Shared workspace boundary (upstream 7fa5b077, #17): the same
+     * CBM_ALLOWED_ROOT decision the MCP index_repository handler applies must
+     * hold here, otherwise an operator's configured boundary would be enforced
+     * on one entry point and not the other. Canonicalize first, then refuse
+     * with 403 when the resolved root escapes an allowed root. */
+    char canonical[CBM_SZ_4K];
+    const char *boundary_reason = NULL;
+    if (cbm_mcp_check_index_root(rpath, canonical, sizeof(canonical), &boundary_reason) != 0) {
+        yyjson_doc_free(doc);
+        cbm_http_replyf(c, 403, g_cors_json, "{\"error\":\"%s\"}",
+                        boundary_reason ? boundary_reason
+                                        : "repo_path is outside the allowed root");
+        return;
+    }
+    /* The job indexes the canonicalized path so symlink/.. aliases resolve to a
+     * single stable root (matches the MCP handler's canonicalization). */
+    rpath = canonical;
 
     /* Find free job slot */
     int slot = -1;

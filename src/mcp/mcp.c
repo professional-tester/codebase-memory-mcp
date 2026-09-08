@@ -4894,18 +4894,19 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
 
     repo_path = canonicalize_repo_path_if_exists(repo_path);
 
-    /* Optional workspace boundary: when CBM_ALLOWED_ROOT is set (agentic /
-     * multi-tenant deployments where repo_path may be influenced by an
-     * untrusted caller), refuse to index a path that resolves outside it.
-     * Unset by default, so the standard "index the path I gave you" behaviour
-     * is unchanged. */
-    const char *allowed_root = getenv("CBM_ALLOWED_ROOT");
-    if (allowed_root && allowed_root[0] && repo_path &&
-        !cbm_path_within_root(allowed_root, repo_path)) {
+    /* Shared workspace boundary (upstream 7fa5b077, #17): every indexing
+     * entry point — this MCP handler and the UI POST /api/index route — routes
+     * through cbm_mcp_check_index_root so a CBM_ALLOWED_ROOT boundary that
+     * holds on one also holds on the other. Unset by default, so the standard
+     * "index the path I gave you" behaviour is unchanged. */
+    const char *boundary_reason = NULL;
+    char canonbuf[CBM_SZ_4K];
+    if (cbm_mcp_check_index_root(repo_path, canonbuf, sizeof(canonbuf), &boundary_reason) != 0) {
         free(mode_str);
         free(name_override);
         free(repo_path);
-        return cbm_mcp_text_result("repo_path is outside the allowed root", true);
+        return cbm_mcp_text_result(
+            boundary_reason ? boundary_reason : "repo_path is outside the allowed root", true);
     }
 
     if (mode_str && strcmp(mode_str, "cross-repo-intelligence") == 0) {
@@ -5166,6 +5167,48 @@ bool cbm_path_within_root(const char *root_path, const char *abs_path) {
         }
     }
     return false;
+}
+
+int cbm_mcp_check_index_root(const char *repo_path, char *canonical_out, size_t canonical_sz,
+                             const char **out_reason) {
+    if (out_reason) {
+        *out_reason = NULL;
+    }
+    const char *resolved = repo_path;
+    if (repo_path && repo_path[0]) {
+        char real[CBM_SZ_4K];
+#ifdef _WIN32
+        if (_fullpath(real, repo_path, sizeof(real))) {
+            cbm_normalize_path_sep(real);
+            resolved = real;
+        }
+#else
+        if (realpath(repo_path, real)) {
+            resolved = real;
+        }
+#endif
+    }
+    if (canonical_out && canonical_sz > 0) {
+        (void)snprintf(canonical_out, canonical_sz, "%s", resolved ? resolved : "");
+    }
+    if (!repo_path || !repo_path[0]) {
+        /* Missing path is handled by the caller (a required-field error), not
+         * a boundary decision. */
+        return 0;
+    }
+    const char *allowed_root = getenv("CBM_ALLOWED_ROOT");
+    if (allowed_root && allowed_root[0] && !cbm_path_within_root(allowed_root, resolved)) {
+        if (out_reason) {
+            /* Keep the exact wording the existing MCP fixture matches, with
+             * guidance appended (upstream 7fa5b077): a boundary is about scope
+             * inside an allowed root, not sensitivity. */
+            *out_reason =
+                "repo_path is outside the allowed root; set CBM_ALLOWED_ROOT so the index "
+                "root is contained within it";
+        }
+        return -1;
+    }
+    return 0;
 }
 
 static char *resolve_snippet_source(const char *root_path, const char *file_path, int start,

@@ -116,6 +116,21 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line);
 /* Handle a tools/call request. Returns MCP tool result JSON. */
 char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const char *args_json);
 
+/* Shared indexing entry-point boundary guard (upstream 7fa5b077, #17).
+ * Routes the MCP index_repository handler and the UI POST /api/index route
+ * through one decision: canonicalize the candidate root, then enforce the
+ * CBM_ALLOWED_ROOT containment boundary using path-component semantics (a
+ * sibling prefix like /home/alice vs /home/alice-evil must NOT count), so a
+ * boundary that holds on one entry point holds on every entry point.
+ *
+ * repo_path may be NULL. canonical_out (when non-NULL/canonical_sz>0) receives
+ * the realpath-resolved path (or the input if it cannot be resolved). Returns
+ * 0 when the path may be indexed; otherwise -1 and *out_reason (when
+ * non-NULL) is set to a static explanation. CBM_ALLOWED_ROOT unset => every
+ * existing path is permitted (no restriction, default behavior unchanged). */
+int cbm_mcp_check_index_root(const char *repo_path, char *canonical_out, size_t canonical_sz,
+                             const char **out_reason);
+
 /* ── Supervised background index (RSS isolation, #832) ────────── */
 
 /* Run a full index of root_path in a supervised worker SUBPROCESS (the same

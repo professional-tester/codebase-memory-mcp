@@ -2687,6 +2687,9 @@ static char *handle_query_graph(cbm_mcp_server_t *srv, const char *args) {
         yyjson_mut_obj_add_str(doc, root, "route",
                                route == CBM_CYPHER_ROUTE_NATIVE_GRAPH
                                    ? "native_graph" : "in_database_compat");
+        if (result.warning) {
+            yyjson_mut_obj_add_str(doc, root, "warning", result.warning);
+        }
         yyjson_mut_obj_add_sint(doc, root, "generation", generation);
         char *json = yy_doc_to_str(doc);
         yyjson_mut_doc_free(doc);
@@ -2752,6 +2755,9 @@ static char *handle_query_graph(cbm_mcp_server_t *srv, const char *args) {
     }
     yyjson_mut_obj_add_val(doc, root, "rows", rows);
     yyjson_mut_obj_add_int(doc, root, "total", result.row_count);
+    if (result.warning) {
+        yyjson_mut_obj_add_str(doc, root, "warning", result.warning);
+    }
 
     if (result.row_count == 0) {
         yyjson_mut_obj_add_str(

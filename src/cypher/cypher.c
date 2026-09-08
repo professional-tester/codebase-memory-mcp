@@ -2996,6 +2996,12 @@ static void process_edges(cbm_store_t *store, cbm_edge_t *edges, int edge_count,
 }
 
 /* Expand variable-length relationship via BFS */
+/* Set when a variable-length hop range is clamped to the engine ceiling
+ * during the CURRENT execution; cbm_cypher_execute turns it into
+ * result->warning so callers can tell "clamped" from "no such path"
+ * (upstream 73a3c347/#797). */
+static _Thread_local int g_cypher_depth_clamped = 0;
+
 static void expand_var_length(cbm_store_t *store, cbm_rel_pattern_t *rel,
                               cbm_node_pattern_t *target_node, binding_t *b, cbm_node_t *src,
                               const char *to_var, binding_t *new_bindings, int *new_count,
@@ -3012,6 +3018,7 @@ static void expand_var_length(cbm_store_t *store, cbm_rel_pattern_t *rel,
         snprintf(req_buf, sizeof(req_buf), "%d", max_depth);
         snprintf(cap_buf, sizeof(cap_buf), "%d", depth_cap);
         cbm_log_warn("cypher.depth_capped", "requested", req_buf, "cap", cap_buf);
+        g_cypher_depth_clamped = depth_cap; /* surfaced as result->warning (#797) */
         max_depth = depth_cap;
     }
     cbm_traverse_result_t tr = {0};
@@ -4694,6 +4701,7 @@ cbm_cypher_route_t cbm_cypher_classify_plan(const cbm_query_t *query,
 int cbm_cypher_execute(cbm_store_t *store, const char *query, const char *project, int max_rows,
                        cbm_cypher_result_t *out) {
     memset(out, 0, sizeof(*out));
+    g_cypher_depth_clamped = 0;
     cypher_deadline_arm(); /* start the wall-clock budget for this query */
     if (max_rows <= 0) {
         max_rows = CYPHER_RESULT_CEILING;
@@ -4764,6 +4772,14 @@ int cbm_cypher_execute(cbm_store_t *store, const char *query, const char *projec
     out->col_count = rb.col_count;
     out->rows = rb.rows;
     out->row_count = rb.row_count;
+    if (g_cypher_depth_clamped > 0) {
+        char wbuf[CBM_SZ_256];
+        snprintf(wbuf, sizeof(wbuf),
+                 "variable-length hop range clamped to the engine ceiling (%d) — an empty "
+                 "result may mean \"clamped\", not \"no such path\"",
+                 g_cypher_depth_clamped);
+        out->warning = heap_strdup(wbuf);
+    }
 
     cbm_query_free(q);
     return 0;
@@ -4773,6 +4789,8 @@ void cbm_cypher_result_free(cbm_cypher_result_t *r) {
     if (!r) {
         return;
     }
+    free(r->warning);
+    r->warning = NULL;
     for (int i = 0; i < r->col_count; i++) {
         safe_str_free(&r->columns[i]);
     }

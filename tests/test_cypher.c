@@ -816,6 +816,93 @@ TEST(cypher_exec_deadline_allows_normal_query_issue601) {
     PASS();
 }
 
+/* Upstream 73a3c347 (#797): variable-length / repeated-variable path
+ * semantics. Fixture: loopy has a SELF-LOOP as one of its outbound CALLS
+ * edges plus a real 2-chain loopy->mid->leaf. Correct semantics:
+ *  - a repeated node variable must unify: (a)-[:CALLS]->(a) matches ONLY
+ *    the self-loop, not every edge;
+ *  - relationship uniqueness within a path: the self-loop cannot be
+ *    traversed repeatedly, so no *k..k path exists beyond the real chain;
+ *  - the engine hop cap must be an ADVERTISED clamp (result->warning), not
+ *    silently indistinguishable from "no such path". */
+TEST(cypher_exec_varlength_path_semantics_issue797) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+    cbm_node_t loopy = {.project = "test",
+                        .label = "Function",
+                        .name = "loopy",
+                        .qualified_name = "test.mod.loopy",
+                        .file_path = "mod.go",
+                        .start_line = 1,
+                        .end_line = 2};
+    cbm_node_t mid = {.project = "test",
+                      .label = "Function",
+                      .name = "mid",
+                      .qualified_name = "test.mod.mid",
+                      .file_path = "mod.go",
+                      .start_line = 3,
+                      .end_line = 4};
+    cbm_node_t leaf = {.project = "test",
+                       .label = "Function",
+                       .name = "leaf",
+                       .qualified_name = "test.mod.leaf",
+                       .file_path = "mod.go",
+                       .start_line = 5,
+                       .end_line = 6};
+    int64_t id_loopy = cbm_store_upsert_node(s, &loopy);
+    int64_t id_mid = cbm_store_upsert_node(s, &mid);
+    int64_t id_leaf = cbm_store_upsert_node(s, &leaf);
+    ASSERT_GT(id_loopy, 0);
+    cbm_edge_t self_loop = {
+        .project = "test", .source_id = id_loopy, .target_id = id_loopy, .type = "CALLS"};
+    cbm_edge_t e1 = {
+        .project = "test", .source_id = id_loopy, .target_id = id_mid, .type = "CALLS"};
+    cbm_edge_t e2 = {.project = "test", .source_id = id_mid, .target_id = id_leaf, .type = "CALLS"};
+    cbm_store_insert_edge(s, &self_loop);
+    cbm_store_insert_edge(s, &e1);
+    cbm_store_insert_edge(s, &e2);
+
+    /* Repeated variable must unify — only the self-loop matches. */
+    cbm_cypher_result_t r1 = {0};
+    ASSERT_EQ(cbm_cypher_execute(s, "MATCH (a)-[:CALLS]->(a) RETURN a.name", "test", 0, &r1), 0);
+    ASSERT_EQ(r1.row_count, 1);
+    cbm_cypher_result_free(&r1);
+
+    /* *2..2 from loopy — only the REAL 2-chain (leaf); the self-loop must
+     * not be reused to pad paths (relationship uniqueness). */
+    cbm_cypher_result_t r2 = {0};
+    ASSERT_EQ(cbm_cypher_execute(s,
+                                 "MATCH (a {name: \"loopy\"})-[:CALLS*2..2]->(b) "
+                                 "RETURN DISTINCT b.name",
+                                 "test", 0, &r2),
+              0);
+    ASSERT_EQ(r2.row_count, 1); /* leaf only */
+    cbm_cypher_result_free(&r2);
+
+    /* No directed path of length 5 exists at all. */
+    cbm_cypher_result_t r3 = {0};
+    ASSERT_EQ(cbm_cypher_execute(s,
+                                 "MATCH (a {name: \"loopy\"})-[:CALLS*5..5]->(b) "
+                                 "RETURN b.name",
+                                 "test", 0, &r3),
+              0);
+    ASSERT_EQ(r3.row_count, 0);
+    cbm_cypher_result_free(&r3);
+
+    /* A hop range beyond the engine ceiling must be an ADVERTISED clamp,
+     * not silently indistinguishable from "no such path". */
+    cbm_cypher_result_t r4 = {0};
+    ASSERT_EQ(
+        cbm_cypher_execute(s, "MATCH (a)-[:CALLS*150..150]->(b) RETURN b.name", "test", 0, &r4), 0);
+    ASSERT_EQ(r4.row_count, 0);
+    ASSERT_NOT_NULL(r4.warning);
+    ASSERT_NOT_NULL(strstr(r4.warning, "clamped"));
+    cbm_cypher_result_free(&r4);
+
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(cypher_exec_where_eq) {
     cbm_store_t *s = setup_cypher_store();
     cbm_cypher_result_t r = {0};
@@ -3146,6 +3233,7 @@ SUITE(cypher) {
     RUN_TEST(cypher_exec_optional_rel_saturated_no_overflow);
     RUN_TEST(cypher_exec_optional_rel_leaf_fallback_survives);
     RUN_TEST(cypher_exec_match_all_functions);
+    RUN_TEST(cypher_exec_varlength_path_semantics_issue797);
     RUN_TEST(cypher_issue240_labels_function);
     RUN_TEST(cypher_issue237_distinct_order_limit);
     RUN_TEST(cypher_issue873_distinct_order_limit_dedupes_before_limit);

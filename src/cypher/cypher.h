@@ -14,6 +14,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <store/store.h>
 
 /* ── Token types ────────────────────────────────────────────────── */
@@ -333,5 +334,17 @@ int cbm_cypher_parse(const char *query, cbm_query_t **out, char **error);
 
 /* Free a query AST. */
 void cbm_query_free(cbm_query_t *q);
+
+/* Test-only (upstream 6bd11ffb, #601): force the wall-clock execution budget
+ * in milliseconds for subsequent queries on the calling thread. 0 = trip on
+ * the first hot-loop check; a negative value restores the default budget. */
+void cbm_cypher_test_set_deadline_ms(int64_t budget_ms);
+
+/* Worst-case binding slot count for a node cross-join (upstream b07dbe67).
+ * Computes the count in size_t and rejects any that would not fit the int
+ * binding counter or would overflow the size_t byte size; returns 0 and writes
+ * *out_n on success, CBM_NOT_FOUND on overflow. Exposed for
+ * arithmetic-boundary unit tests. */
+int cbm_cypher_cross_join_alloc(int bind_count, int extra_count, bool opt, size_t *out_n);
 
 #endif /* CBM_CYPHER_H */

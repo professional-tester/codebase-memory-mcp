@@ -35,6 +35,7 @@ enum {
 #define CYP_DBL_MAX 1e308
 
 #include <ctype.h>
+#include <limits.h> /* INT_MAX for cross-join allocation bounds */
 #include "foundation/compat_regex.h"
 #include <stddef.h>
 #include <stdint.h> // int64_t
@@ -430,12 +431,35 @@ void cbm_lex_free(cbm_lex_result_t *r) {
  *  PARSER
  * ══════════════════════════════════════════════════════════════════ */
 
+/* The WHERE grammar descends once per nested '(' and once per NOT, so parse
+ * depth follows the query text rather than anything bounded (upstream
+ * 886a8856). 256 is far past any hand-written or generated query while
+ * leaving the stack untouched. */
+enum { CYPHER_MAX_PARSE_DEPTH = 256 };
+
 typedef struct {
     const cbm_token_t *tokens;
     int count;
     int pos;
+    int depth; /* current recursive-descent depth; see CYPHER_MAX_PARSE_DEPTH */
     char error[CBM_SZ_512];
 } parser_t;
+
+/* Enter one level of recursive descent. Returns false when the cap is hit, in
+ * which case the caller must return NULL without recursing. */
+static bool parse_depth_enter(parser_t *p) {
+    if (p->depth >= CYPHER_MAX_PARSE_DEPTH) {
+        snprintf(p->error, sizeof(p->error), "expression nested deeper than %d levels",
+                 CYPHER_MAX_PARSE_DEPTH);
+        return false;
+    }
+    p->depth++;
+    return true;
+}
+
+static void parse_depth_leave(parser_t *p) {
+    p->depth--;
+}
 
 static const cbm_token_t *peek(parser_t *p) {
     if (p->pos >= p->count) {
@@ -1101,7 +1125,11 @@ static cbm_expr_t *parse_condition_expr(parser_t *p) {
 /* Atom: ( expr ) | condition */
 static cbm_expr_t *parse_atom_expr(parser_t *p) { // NOLINT(misc-no-recursion)
     if (match(p, TOK_LPAREN)) {
+        if (!parse_depth_enter(p)) {
+            return NULL;
+        }
         cbm_expr_t *e = parse_or_expr(p);
+        parse_depth_leave(p);
         expect(p, TOK_RPAREN);
         return e;
     }
@@ -1111,7 +1139,11 @@ static cbm_expr_t *parse_atom_expr(parser_t *p) { // NOLINT(misc-no-recursion)
 /* NOT: NOT atom | atom */
 static cbm_expr_t *parse_not_expr(parser_t *p) { // NOLINT(misc-no-recursion)
     if (match(p, TOK_NOT)) {
+        if (!parse_depth_enter(p)) {
+            return NULL;
+        }
         cbm_expr_t *child = parse_not_expr(p);
+        parse_depth_leave(p);
         return child ? expr_not(child) : NULL;
     }
     return parse_atom_expr(p);
@@ -1607,6 +1639,8 @@ static void parse_order_by_clause(parser_t *p, cbm_return_clause_t *r) {
 }
 
 /* Parse RETURN/WITH clause (shared logic) */
+static void free_return_clause(cbm_return_clause_t *r);
+
 static int parse_return_or_with(parser_t *p, cbm_return_clause_t **out, bool is_with) {
     cbm_token_type_t tok = (int)is_with ? TOK_WITH : TOK_RETURN;
     /* For WITH, we need to check it's standalone (not preceded by STARTS) */
@@ -1639,8 +1673,7 @@ static int parse_return_or_with(parser_t *p, cbm_return_clause_t **out, bool is_
 
         cbm_return_item_t item = {0};
         if (parse_return_item(p, &item) < 0) {
-            free(r->items);
-            free(r);
+            free_return_clause(r);
             return CBM_NOT_FOUND;
         }
 
@@ -1657,8 +1690,7 @@ static int parse_return_or_with(parser_t *p, cbm_return_clause_t **out, bool is_
      * parsed item count to that width so an over-wide RETURN is rejected here
      * instead of writing past those arrays downstream. */
     if (r->count > CBM_SZ_32) {
-        free(r->items);
-        free(r);
+        free_return_clause(r);
         return CBM_NOT_FOUND;
     }
 
@@ -1736,23 +1768,32 @@ static void parse_unwind_clause(parser_t *p, cbm_query_t *q) {
         advance(p);
         char buf[CBM_SZ_2K] = "[";
         int blen = SKIP_ONE;
+        /* snprintf returns the length it WOULD have written, so a single
+         * oversized token can push blen past sizeof(buf) (upstream d0457f2b).
+         * Clamp after every write and guard the raw buf[blen++] stores. */
+        const int cap = (int)sizeof(buf);
         while (!check(p, TOK_RBRACKET) && !check(p, TOK_EOF)) {
-            if (blen > SKIP_ONE) {
+            if (blen > SKIP_ONE && blen < cap - SKIP_ONE) {
                 buf[blen++] = ',';
             }
             if (check(p, TOK_STRING)) {
-                blen += snprintf(buf + blen, sizeof(buf) - blen, "\"%s\"", peek(p)->text);
+                blen += snprintf(buf + blen, (size_t)(cap - blen), "\"%s\"", peek(p)->text);
                 advance(p);
             } else if (check(p, TOK_NUMBER)) {
-                blen += snprintf(buf + blen, sizeof(buf) - blen, "%s", peek(p)->text);
+                blen += snprintf(buf + blen, (size_t)(cap - blen), "%s", peek(p)->text);
                 advance(p);
             } else {
                 advance(p);
             }
+            if (blen >= cap) {
+                blen = cap - SKIP_ONE;
+            }
             match(p, TOK_COMMA);
         }
         expect(p, TOK_RBRACKET);
-        buf[blen++] = ']';
+        if (blen < cap - SKIP_ONE) {
+            buf[blen++] = ']';
+        }
         buf[blen] = '\0';
         q->unwind_expr = heap_strdup(buf);
     } else if (check(p, TOK_IDENT)) {
@@ -2599,6 +2640,49 @@ static void rb_add_row(result_builder_t *rb, const char **values) {
  * Prevents accidental multi-GB JSON payloads from unbounded MATCH (n) RETURN n. */
 #define CYPHER_RESULT_CEILING 100000
 
+/* Wall-clock execution deadline (upstream 6bd11ffb, #601). The row ceiling
+ * only fires once rows exist, but an unbounded OPTIONAL MATCH or a GROUP BY
+ * with ~one group per node does O(bindings x groups) work for minutes before
+ * a single row is produced, so the ceiling never trips and the caller hangs.
+ * A monotonic deadline aborts runaway queries with a clear, actionable error.
+ * Checked (throttled) in the scan, expansion and aggregation hot loops.
+ * Reuses the fork's cbm_now_ms clock; no new public configuration option. */
+#define CYPHER_DEADLINE_BUDGET_MS 30000  /* 30s: generous for legit heavy queries */
+#define CYPHER_DEADLINE_CHECK_MASK 0x3FF /* sample the clock every 1024 iterations */
+
+static _Thread_local uint64_t g_cypher_deadline_ms = 0; /* absolute; 0 = disarmed */
+static _Thread_local bool g_cypher_timed_out = false;
+static _Thread_local int64_t g_cypher_deadline_override_ms = -1; /* test hook; <0 = default */
+
+static void cypher_deadline_arm(void) {
+    g_cypher_timed_out = false;
+    int64_t budget = g_cypher_deadline_override_ms >= 0 ? g_cypher_deadline_override_ms
+                                                        : CYPHER_DEADLINE_BUDGET_MS;
+    g_cypher_deadline_ms = cbm_now_ms() + (uint64_t)budget;
+}
+
+/* True once the query has run past its wall-clock budget. Sticky: after the
+ * first trip every subsequent call returns true, so later loops short-circuit. */
+static bool cypher_deadline_exceeded(void) {
+    if (g_cypher_timed_out) {
+        return true;
+    }
+    if (g_cypher_deadline_ms == 0) {
+        return false;
+    }
+    if (cbm_now_ms() >= g_cypher_deadline_ms) {
+        g_cypher_timed_out = true;
+        return true;
+    }
+    return false;
+}
+
+/* Test-only: force the execution budget (ms) for subsequent queries on this
+ * thread. 0 = trip on the first hot-loop check; <0 restores the default. */
+void cbm_cypher_test_set_deadline_ms(int64_t budget_ms) {
+    g_cypher_deadline_override_ms = budget_ms;
+}
+
 /* ── Binding virtual variables (for WITH clause) ──────────────── */
 
 static const char *binding_get_virtual(binding_t *b, const char *var, const char *prop) {
@@ -2995,13 +3079,27 @@ static void expand_pattern_rels(cbm_store_t *store, cbm_pattern_t *pat, binding_
                                 int *bind_count, const int *bind_cap, const char **var_name,
                                 bool is_optional) {
     for (int ri = 0; ri < pat->rel_count; ri++) {
+        /* Stop expanding further hops once the wall-clock budget is spent
+         * (an unbounded expansion is exactly what blows up here). */
+        if (cypher_deadline_exceeded()) {
+            return;
+        }
         cbm_rel_pattern_t *rel = &pat->rels[ri];
         cbm_node_pattern_t *target_node = &pat->nodes[ri + SKIP_ONE];
         const char *to_var = target_node->variable ? target_node->variable : "_n_t";
 
         bool is_variable_length = (rel->min_hops != SKIP_ONE || rel->max_hops != SKIP_ONE);
 
-        size_t alloc_n = (size_t)*bind_cap * (size_t)CYP_GROWTH_10 + SKIP_ONE;
+        /* Size this hop's output for BOTH writers without dropping any row
+         * (upstream c2a19b89): the expansion helpers emit at most
+         * max_new = bind_cap*10 rows, and the OPTIONAL fallback emits at most
+         * one row per source (<= *bind_count). A source either matches or
+         * takes the fallback, never both, so the counts are additive and
+         * bounded by max_new + *bind_count. Computed in size_t so the product
+         * cannot overflow. The previous "+ 1" sizing fit only a SINGLE
+         * fallback row after a saturated expansion; a second one ran off the
+         * end (heap OOB). */
+        size_t alloc_n = (size_t)*bind_cap * (size_t)CYP_GROWTH_10 + (size_t)*bind_count;
         binding_t *new_bindings = malloc(alloc_n * sizeof(binding_t));
         if (!new_bindings) {
             return; /* OOM: leave existing bindings untouched rather than corrupt */
@@ -3009,6 +3107,9 @@ static void expand_pattern_rels(cbm_store_t *store, cbm_pattern_t *pat, binding_
         int new_count = 0;
 
         for (int bi = 0; bi < *bind_count; bi++) {
+            if ((bi & CYPHER_DEADLINE_CHECK_MASK) == 0 && cypher_deadline_exceeded()) {
+                break;
+            }
             binding_t *b = &(*bindings)[bi];
             cbm_node_t *src = binding_get(b, *var_name);
             if (!src) {
@@ -3026,7 +3127,11 @@ static void expand_pattern_rels(cbm_store_t *store, cbm_pattern_t *pat, binding_
                                     &new_count, max_new, &match_count);
             }
 
-            /* OPTIONAL MATCH: keep binding with empty target if no matches */
+            /* OPTIONAL MATCH: no expansion for this source, so keep the binding
+             * with the target unbound (projection renders it ""). The buffer is
+             * sized max_new + *bind_count precisely so every such fallback row
+             * has a slot — no guard needed, and no OPTIONAL no-match row is
+             * dropped. */
             if (is_optional && match_count == 0) {
                 binding_t nb = {0};
                 binding_copy(&nb, b);
@@ -4052,6 +4157,11 @@ static void execute_return_agg(cbm_return_clause_t *ret, binding_t *bindings, in
     int agg_count = 0;
 
     for (int bi = 0; bi < bind_count; bi++) {
+        /* Grouping is O(bindings x groups) — the dominant cost on a
+         * whole-graph GROUP BY. Abort if the wall-clock budget is blown. */
+        if ((bi & CYPHER_DEADLINE_CHECK_MASK) == 0 && cypher_deadline_exceeded()) {
+            break;
+        }
         char key[CBM_SZ_1K] = "";
         const char *vals[CBM_SZ_32];
         char valbufs[CBM_SZ_32][CBM_SZ_512];
@@ -4172,19 +4282,53 @@ static void execute_default_projection(cbm_pattern_t *pat0, binding_t *bindings,
     }
 }
 
-/* Cross-join node-only pattern into existing bindings */
-static void cross_join_nodes(binding_t **bindings, int *bind_count, cbm_node_t *extra_nodes,
-                             int extra_count, const char *nvar, bool opt) {
-    binding_t *new_bindings = malloc(((*bind_count * extra_count) + SKIP_ONE) * sizeof(binding_t));
-    int new_count = 0;
+/* Worst-case binding_t slot count for a node cross-join: one row per
+ * (existing binding x extra node), plus — for an OPTIONAL join with no extra
+ * nodes — one fallback row per existing binding, plus a trailing sentinel slot.
+ *
+ * The plain-int product bind_count * extra_count overflows to a negative/garbage
+ * malloc size on large graphs, so the count is computed in size_t and rejected
+ * if it would not fit the int binding counter or would overflow the size_t byte
+ * size. Returns 0 and writes *out_n on success, CBM_NOT_FOUND on overflow.
+ * Non-static so the arithmetic boundary can be unit-tested directly (upstream
+ * b07dbe67). */
+int cbm_cypher_cross_join_alloc(int bind_count, int extra_count, bool opt, size_t *out_n) {
+    size_t per_binding = extra_count > 0 ? (size_t)extra_count : (opt ? (size_t)SKIP_ONE : 0U);
+    size_t rows = (size_t)bind_count * per_binding;
+    if (rows > (size_t)INT_MAX) {
+        return CBM_NOT_FOUND; /* new_count would not fit the int binding counter */
+    }
+    size_t n = rows + SKIP_ONE;
+    if (n > SIZE_MAX / sizeof(binding_t)) {
+        return CBM_NOT_FOUND; /* alloc_n * sizeof(binding_t) would overflow size_t */
+    }
+    *out_n = n;
+    return 0;
+}
+
+/* Cross-join node-only pattern into existing bindings. Returns 0 on success,
+ * CBM_NOT_FOUND when the allocation is refused (overflow) or fails (OOM); the
+ * caller propagates that as a query error rather than silently skipping the
+ * MATCH, which would return a wrong (short) result. */
+static int cross_join_nodes(binding_t **bindings, int *bind_count, cbm_node_t *extra_nodes,
+                            int extra_count, const char *nvar, bool opt) {
+    size_t alloc_n = 0;
+    if (cbm_cypher_cross_join_alloc(*bind_count, extra_count, opt, &alloc_n) != 0) {
+        return CBM_NOT_FOUND; /* product overflows int/size_t: fail the query */
+    }
+    binding_t *new_bindings = malloc(alloc_n * sizeof(binding_t));
+    if (!new_bindings) {
+        return CBM_NOT_FOUND; /* OOM: propagate, don't silently skip the MATCH */
+    }
+    size_t new_count = 0;
     for (int bi = 0; bi < *bind_count; bi++) {
-        for (int ni = 0; ni < extra_count; ni++) {
+        for (int ni = 0; ni < extra_count && new_count < alloc_n; ni++) {
             binding_t nb = {0};
             binding_copy(&nb, &(*bindings)[bi]);
             binding_set(&nb, nvar, &extra_nodes[ni]);
             new_bindings[new_count++] = nb;
         }
-        if (opt && extra_count == 0) {
+        if (opt && extra_count == 0 && new_count < alloc_n) {
             binding_t nb = {0};
             binding_copy(&nb, &(*bindings)[bi]);
             new_bindings[new_count++] = nb;
@@ -4195,7 +4339,8 @@ static void cross_join_nodes(binding_t **bindings, int *bind_count, cbm_node_t *
     }
     free(*bindings);
     *bindings = new_bindings;
-    *bind_count = new_count;
+    *bind_count = (int)new_count; /* new_count <= INT_MAX, guaranteed above */
+    return 0;
 }
 
 /* Cross-join pattern-with-rels into existing bindings */
@@ -4334,7 +4479,7 @@ static void expand_from_bound_terminal(cbm_store_t *store, cbm_pattern_t *patn,
 }
 
 /* Expand additional MATCH patterns (pi >= 1) */
-static void expand_additional_patterns(cbm_store_t *store, cbm_query_t *q, const char *project,
+static int expand_additional_patterns(cbm_store_t *store, cbm_query_t *q, const char *project,
                                        int max_rows, binding_t **bindings, int *bind_count,
                                        int *bind_cap) {
     for (int pi = SKIP_ONE; pi < q->pattern_count; pi++) {
@@ -4365,14 +4510,19 @@ static void expand_additional_patterns(cbm_store_t *store, cbm_query_t *q, const
         cbm_node_t *extra_nodes = NULL;
         int extra_count = 0;
         scan_pattern_nodes(store, project, max_rows, &patn->nodes[0], &extra_nodes, &extra_count);
+        int rc = 0;
         if (patn->rel_count == 0) {
-            cross_join_nodes(bindings, bind_count, extra_nodes, extra_count, nvar, opt);
+            rc = cross_join_nodes(bindings, bind_count, extra_nodes, extra_count, nvar, opt);
         } else {
             cross_join_with_rels(store, patn, bindings, bind_count, extra_nodes, extra_count, nvar,
                                  opt);
         }
         cbm_store_free_nodes(extra_nodes, extra_count);
+        if (rc != 0) {
+            return rc; /* allocation refused/failed: propagate as a query error */
+        }
     }
+    return 0;
 }
 
 /* Project RETURN clause results */
@@ -4420,6 +4570,9 @@ static int execute_single(cbm_store_t *store, cbm_query_t *q, const char *projec
     const char *var_name = pat0->nodes[0].variable ? pat0->nodes[0].variable : "_n0";
 
     for (int i = 0; i < scan_count && bind_count < bind_cap; i++) {
+        if ((i & CYPHER_DEADLINE_CHECK_MASK) == 0 && cypher_deadline_exceeded()) {
+            break;
+        }
         binding_t b = {0};
         b.store = store;
         binding_set(&b, var_name, &scanned[i]);
@@ -4436,7 +4589,15 @@ static int execute_single(cbm_store_t *store, cbm_query_t *q, const char *projec
                         q->pattern_optional[0]);
 
     /* Step 2b: Additional patterns */
-    expand_additional_patterns(store, q, project, max_rows, &bindings, &bind_count, &bind_cap);
+    if (expand_additional_patterns(store, q, project, max_rows, &bindings, &bind_count, &bind_cap) !=
+        0) {
+        for (int bi = 0; bi < bind_count; bi++) {
+            binding_free(&bindings[bi]);
+        }
+        free(bindings);
+        cbm_store_free_nodes(scanned, scan_count);
+        return CBM_NOT_FOUND; /* cross-join allocation refused/failed */
+    }
 
     /* Step 3: Late WHERE */
     if (q->where && (pat0->rel_count > 0 || q->pattern_count > SKIP_ONE)) {
@@ -4488,6 +4649,7 @@ cbm_cypher_route_t cbm_cypher_classify_plan(const cbm_query_t *query,
 int cbm_cypher_execute(cbm_store_t *store, const char *query, const char *project, int max_rows,
                        cbm_cypher_result_t *out) {
     memset(out, 0, sizeof(*out));
+    cypher_deadline_arm(); /* start the wall-clock budget for this query */
     if (max_rows <= 0) {
         max_rows = CYPHER_RESULT_CEILING;
     }
@@ -4500,9 +4662,10 @@ int cbm_cypher_execute(cbm_store_t *store, const char *query, const char *projec
     }
 
     result_builder_t rb = {0};
-    // cppcheck-suppress knownConditionTrueFalse
     if (execute_single(store, q, project, max_rows, &rb) < 0) {
+        rb_free(&rb);
         cbm_query_free(q);
+        out->error = heap_strdup("query aborted: out of memory or an allocation limit was reached");
         return CBM_NOT_FOUND;
     }
 
@@ -4510,11 +4673,12 @@ int cbm_cypher_execute(cbm_store_t *store, const char *query, const char *projec
     cbm_query_t *uq = q->union_next;
     while (uq) {
         result_builder_t rb2 = {0};
-        // cppcheck-suppress knownConditionTrueFalse
         if (execute_single(store, uq, project, max_rows, &rb2) < 0) {
             rb_free(&rb);
             rb_free(&rb2);
             cbm_query_free(q);
+            out->error =
+                heap_strdup("query aborted: out of memory or an allocation limit was reached");
             return CBM_NOT_FOUND;
         }
         /* Concatenate rows from rb2 into rb */
@@ -4529,6 +4693,18 @@ int cbm_cypher_execute(cbm_store_t *store, const char *query, const char *projec
     /* UNION (not ALL) deduplication */
     if (q->union_next && !q->union_all) {
         rb_apply_distinct(&rb);
+    }
+
+    /* Abort a runaway query that blew the wall-clock budget before it can
+     * return a misleading partial result. Checked before the row ceiling. */
+    if (g_cypher_timed_out) {
+        rb_free(&rb);
+        cbm_query_free(q);
+        out->error =
+            heap_strdup("query exceeded the execution time limit — narrow the pattern with a WHERE "
+                        "filter, use a directed MATCH instead of an unbounded OPTIONAL MATCH, or "
+                        "add LIMIT");
+        return CBM_NOT_FOUND;
     }
 
     /* Check ceiling */

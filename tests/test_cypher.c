@@ -489,6 +489,298 @@ TEST(cypher_exec_match_all_functions) {
     PASS();
 }
 
+/* Upstream 886a8856: the WHERE grammar recurses once per nested '(' and once
+ * per NOT with no depth counter, so tens of KB of nesting exhausted the stack
+ * at parse time. Parse in a forked child so a crash surfaces as a killing
+ * signal; a bounded parser must reject cleanly instead. */
+TEST(cypher_deep_nesting_rejected_not_crash) {
+#ifdef _WIN32
+    SKIP_PLATFORM("fork crash-isolation is POSIX-only; the depth cap is platform-agnostic");
+#else
+    enum { NEST = 30000 };
+    fflush(NULL);
+    pid_t pid = fork();
+    if (pid == 0) {
+        char *q = malloc(NEST * 2 + 64);
+        if (!q) {
+            _exit(2);
+        }
+        int n = snprintf(q, 64, "MATCH (f:Function) WHERE ");
+        for (int i = 0; i < NEST; i++) {
+            q[n++] = '(';
+        }
+        n += snprintf(q + n, 32, "f.name = \"x\"");
+        for (int i = 0; i < NEST; i++) {
+            q[n++] = ')';
+        }
+        q[n] = '\0';
+        cbm_store_t *s = setup_cypher_store();
+        cbm_cypher_result_t r = {0};
+        /* Any clean outcome is acceptable — success or a parse error. Only a
+         * crash is a failure, and that is what the signal check below catches. */
+        (void)cbm_cypher_execute(s, q, "test", 0, &r);
+        cbm_cypher_result_free(&r);
+        cbm_store_close(s);
+        free(q);
+        _exit(0);
+    }
+    ASSERT_TRUE(pid > 0);
+    int status = 0;
+    (void)waitpid(pid, &status, 0);
+    if (WIFSIGNALED(status)) {
+        char m[96];
+        snprintf(m, sizeof(m), "parser killed by signal %d — unbounded recursion depth",
+                 WTERMSIG(status));
+        FAIL(m);
+    }
+    ASSERT_TRUE(WIFEXITED(status));
+    ASSERT_EQ(WEXITSTATUS(status), 0);
+    PASS();
+#endif
+}
+
+/* Upstream d0457f2b: an UNWIND literal list whose element is longer than the
+ * 2KB assembly buffer overflowed the stack — snprintf reports the length it
+ * WOULD have written, so blen ran past sizeof(buf) and the trailing writes
+ * went out of bounds. The query text is agent-controlled via query_graph. */
+TEST(cypher_parse_unwind_oversized_literal_no_overflow) {
+    char query[4096];
+    char big[3000];
+    memset(big, 'a', sizeof(big) - 1);
+    big[sizeof(big) - 1] = '\0';
+    snprintf(query, sizeof(query), "UNWIND [\"%s\"] AS x MATCH (f) RETURN f.name", big);
+
+    cbm_query_t *q = NULL;
+    char *err = NULL;
+    int rc = cbm_cypher_parse(query, &q, &err);
+    /* Must not crash and must produce a NUL-terminated, in-bounds expression. */
+    ASSERT_EQ(rc, 0);
+    ASSERT_NOT_NULL(q->unwind_expr);
+    ASSERT_STR_EQ(q->unwind_alias, "x");
+    cbm_query_free(q);
+    PASS();
+}
+
+/* Companion: many oversized elements accumulate blen well past the buffer,
+ * which also underflowed the (size_t)(cap - blen) length passed to snprintf. */
+TEST(cypher_parse_unwind_many_elements_no_overflow) {
+    char query[8192];
+    int off = snprintf(query, sizeof(query), "UNWIND [");
+    for (int i = 0; i < 200; i++) {
+        off += snprintf(query + off, sizeof(query) - (size_t)off, "%s\"element_value_%d\"",
+                        i ? "," : "", i);
+    }
+    snprintf(query + off, sizeof(query) - (size_t)off, "] AS x MATCH (f) RETURN f.name");
+
+    cbm_query_t *q = NULL;
+    char *err = NULL;
+    int rc = cbm_cypher_parse(query, &q, &err);
+    ASSERT_EQ(rc, 0);
+    ASSERT_NOT_NULL(q->unwind_expr);
+    cbm_query_free(q);
+    PASS();
+}
+
+/* Upstream b07dbe67: an OPTIONAL MATCH whose label matches zero nodes drove
+ * cross_join_nodes with extra_count == 0. The old allocation
+ * (bind_count * 0 + 1) reserved a single slot, but the OPTIONAL fallback then
+ * wrote one binding per existing row — heap OOB once the first MATCH bound
+ * more than one node. The query text is agent-controlled via query_graph. */
+TEST(cypher_exec_optional_empty_label_no_overflow) {
+    cbm_store_t *s = setup_cypher_store(); /* 4 Function nodes */
+    cbm_cypher_result_t r = {0};
+
+    int rc = cbm_cypher_execute(
+        s, "MATCH (a:Function) OPTIONAL MATCH (b:NoSuchLabel) RETURN a.name", "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    /* One row per Function, each with b left unbound. */
+    ASSERT_EQ(r.row_count, 4);
+
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* Arithmetic-boundary companion: the node cross-join sizes its buffer from
+ * bind_count * extra_count. As a plain int that product wraps past INT_MAX to
+ * a negative/garbage malloc size. cbm_cypher_cross_join_alloc now computes it
+ * in size_t and rejects counts that would not fit the int binding counter or
+ * overflow the byte size. Tested directly so the boundary is exercised without
+ * allocating billions of bindings. */
+TEST(cypher_cross_join_alloc_rejects_overflow) {
+    size_t n = 0;
+
+    /* 46341 * 46341 = 2147488281 > INT_MAX (2147483647): pre-fix the int
+     * product wrapped negative -> tiny malloc -> heap OOB. Now rejected. */
+    ASSERT_TRUE(cbm_cypher_cross_join_alloc(46341, 46341, false, &n) != 0);
+
+    /* A normal join still succeeds: bind_count * extra_count + 1 slots. */
+    ASSERT_EQ(cbm_cypher_cross_join_alloc(4, 3, false, &n), 0);
+    ASSERT_EQ(n, (size_t)13);
+
+    /* OPTIONAL with no extra nodes reserves one fallback row per binding + 1. */
+    ASSERT_EQ(cbm_cypher_cross_join_alloc(4, 0, true, &n), 0);
+    ASSERT_EQ(n, (size_t)5);
+
+    /* Non-OPTIONAL with no extra nodes: just the sentinel slot. */
+    ASSERT_EQ(cbm_cypher_cross_join_alloc(4, 0, false, &n), 0);
+    ASSERT_EQ(n, (size_t)1);
+
+    PASS();
+}
+
+/* Upstream c2a19b89: expand_pattern_rels sized its OPTIONAL-expansion output
+ * as bind_cap*10 + 1 — room for the bounded expansion plus a SINGLE OPTIONAL
+ * fallback row. When one source saturated the expansion and two or more later
+ * sources took the OPTIONAL (no-match) path, the second fallback write ran
+ * past the allocation (heap OOB). The buffer now holds max_new + bind_count
+ * rows, and the LIMIT caps only the output. */
+TEST(cypher_exec_optional_rel_saturated_no_overflow) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+
+    cbm_node_t hub = {
+        .project = "test", .label = "Function", .name = "hub", .qualified_name = "test.hub"};
+    int64_t hub_id = cbm_store_upsert_node(s, &hub);
+    for (int i = 0; i < 20; i++) {
+        char nm[32];
+        char qn[48];
+        snprintf(nm, sizeof(nm), "leaf%02d", i);
+        snprintf(qn, sizeof(qn), "test.leaf%02d", i);
+        cbm_node_t leaf = {
+            .project = "test", .label = "Function", .name = nm, .qualified_name = qn};
+        cbm_store_upsert_node(s, &leaf);
+    }
+
+    /* Give the hub 300 CALLS edges (> max_new = 210) so its expansion saturates
+     * max_new; targets are non-Function so they don't inflate bind_cap. */
+    for (int i = 0; i < 300; i++) {
+        char nm[32];
+        char qn[48];
+        snprintf(nm, sizeof(nm), "callee%d", i);
+        snprintf(qn, sizeof(qn), "test.callee%d", i);
+        cbm_node_t callee = {.project = "test", .label = "Var", .name = nm, .qualified_name = qn};
+        int64_t cid = cbm_store_upsert_node(s, &callee);
+        cbm_edge_t e = {.project = "test", .source_id = hub_id, .target_id = cid, .type = "CALLS"};
+        cbm_store_insert_edge(s, &e);
+    }
+
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(
+        s, "MATCH (a:Function) OPTIONAL MATCH (a)-[:CALLS]->(b) RETURN a.name", "test", 5, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_GT(r.row_count, 0);
+    ASSERT_TRUE(r.row_count <= 5);
+
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* Companion to the saturation regression: when the expansion does NOT
+ * saturate, every leaf's OPTIONAL fallback row must survive with its target
+ * unbound. A `row_count > 0` check is too weak — it can pass on hub rows
+ * alone — so this asserts a specific leaf appears with an empty b.name, and
+ * that a real expanded hub row is present too. */
+TEST(cypher_exec_optional_rel_leaf_fallback_survives) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+
+    cbm_node_t hub = {
+        .project = "test", .label = "Function", .name = "hub", .qualified_name = "test.hub"};
+    int64_t hub_id = cbm_store_upsert_node(s, &hub);
+    for (int i = 0; i < 3; i++) {
+        char nm[32];
+        char qn[48];
+        snprintf(nm, sizeof(nm), "leaf%d", i);
+        snprintf(qn, sizeof(qn), "test.leaf%d", i);
+        cbm_node_t leaf = {
+            .project = "test", .label = "Function", .name = nm, .qualified_name = qn};
+        cbm_store_upsert_node(s, &leaf);
+    }
+    for (int i = 0; i < 2; i++) {
+        char nm[32];
+        char qn[48];
+        snprintf(nm, sizeof(nm), "callee%d", i);
+        snprintf(qn, sizeof(qn), "test.callee%d", i);
+        cbm_node_t callee = {.project = "test", .label = "Var", .name = nm, .qualified_name = qn};
+        int64_t cid = cbm_store_upsert_node(s, &callee);
+        cbm_edge_t e = {.project = "test", .source_id = hub_id, .target_id = cid, .type = "CALLS"};
+        cbm_store_insert_edge(s, &e);
+    }
+
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(
+        s, "MATCH (a:Function) OPTIONAL MATCH (a)-[:CALLS]->(b) RETURN a.name, b.name", "test", 0,
+        &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.col_count, 2);
+
+    bool leaf_fallback = false;
+    bool hub_expanded = false;
+    for (int i = 0; i < r.row_count; i++) {
+        const char *a = r.rows[i][0];
+        const char *b = r.rows[i][1];
+        if (strcmp(a, "leaf0") == 0 && b[0] == '\0') {
+            leaf_fallback = true;
+        }
+        if (strcmp(a, "hub") == 0 && b[0] != '\0') {
+            hub_expanded = true;
+        }
+    }
+    ASSERT_TRUE(leaf_fallback); /* the OPTIONAL no-match row survived */
+    ASSERT_TRUE(hub_expanded);  /* the expansion still produced bound rows */
+
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* Upstream 6bd11ffb (#601): an unbounded whole-graph OPTIONAL MATCH / GROUP
+ * BY does O(bindings x groups) work for minutes with no wall-clock guard —
+ * the 100k row ceiling never fires because no rows are produced, so
+ * query_graph just hangs. With the deadline armed to trip immediately
+ * (budget 0), the runaway query must abort with a clear error instead of
+ * returning a (misleading, possibly partial) result. */
+TEST(cypher_exec_deadline_aborts_runaway_query_issue601) {
+    cbm_store_t *s = setup_cypher_store();
+    cbm_cypher_result_t r = {0};
+
+    cbm_cypher_test_set_deadline_ms(0); /* trip on the first hot-loop check */
+    int rc = cbm_cypher_execute(
+        s, "MATCH (a) OPTIONAL MATCH (a)-[:CALLS]->(b) RETURN a.qualified_name, count(b)", "test",
+        0, &r);
+    cbm_cypher_test_set_deadline_ms(-1); /* restore default before asserting (thread-local) */
+
+    ASSERT_TRUE(rc != 0);
+    ASSERT_NOT_NULL(r.error);
+    ASSERT_TRUE(strstr(r.error, "time limit") != NULL);
+    ASSERT_EQ(r.row_count, 0);
+
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* Companion: the default (ample) budget must NOT false-positive on a normal
+ * small query — it still returns its rows. */
+TEST(cypher_exec_deadline_allows_normal_query_issue601) {
+    cbm_store_t *s = setup_cypher_store();
+    cbm_cypher_result_t r = {0};
+
+    int rc = cbm_cypher_execute(
+        s, "MATCH (a) OPTIONAL MATCH (a)-[:CALLS]->(b) RETURN a.qualified_name, count(b)", "test",
+        0, &r);
+
+    ASSERT_EQ(rc, 0);
+    ASSERT_TRUE(r.error == NULL);
+    ASSERT_GT(r.row_count, 0);
+
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(cypher_exec_where_eq) {
     cbm_store_t *s = setup_cypher_store();
     cbm_cypher_result_t r = {0};
@@ -2700,6 +2992,15 @@ SUITE(cypher) {
     RUN_TEST(cypher_parse_inline_props);
     RUN_TEST(cypher_parse_error);
     /* Execution */
+    RUN_TEST(cypher_exec_deadline_aborts_runaway_query_issue601);
+    RUN_TEST(cypher_exec_deadline_allows_normal_query_issue601);
+    RUN_TEST(cypher_deep_nesting_rejected_not_crash);
+    RUN_TEST(cypher_parse_unwind_oversized_literal_no_overflow);
+    RUN_TEST(cypher_parse_unwind_many_elements_no_overflow);
+    RUN_TEST(cypher_exec_optional_empty_label_no_overflow);
+    RUN_TEST(cypher_cross_join_alloc_rejects_overflow);
+    RUN_TEST(cypher_exec_optional_rel_saturated_no_overflow);
+    RUN_TEST(cypher_exec_optional_rel_leaf_fallback_survives);
     RUN_TEST(cypher_exec_match_all_functions);
     RUN_TEST(cypher_issue240_labels_function);
     RUN_TEST(cypher_issue237_distinct_order_limit);

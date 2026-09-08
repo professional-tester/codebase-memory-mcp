@@ -1178,8 +1178,25 @@ static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
     project_db_path(project, path, sizeof(path));
     srv->store = cbm_store_open_path_query(path);
     if (srv->store) {
-        /* Check DB integrity — back up (never silently delete) a corrupt DB */
-        if (!cbm_store_check_integrity(srv->store)) {
+        /* Check DB integrity — quarantine only on CONFIRMED corruption
+         * (upstream #1206/#1037). The plain bool check cannot tell a malformed
+         * projects table from a transient SQLITE_BUSY/LOCKED race with another
+         * instance holding the writer lock, and it never runs quick_check, so
+         * page-torn DBs with an intact projects table sail through. */
+        cbm_integrity_verdict_t verdict = cbm_store_check_integrity_verdict(srv->store);
+        if (verdict == CBM_INTEGRITY_TRANSIENT) {
+            /* The DB could not be conclusively evaluated (lock contention,
+             * busy writer, IO hiccup). Do NOT quarantine — close and let the
+             * next resolve retry. A spurious quarantine here is exactly what
+             * destroys healthy DBs under concurrent access. */
+            cbm_log_error("store.integrity_transient", "project", project, "path", path, "action",
+                          "integrity inconclusive (lock/IO) — not quarantining, retry on next "
+                          "resolve");
+            cbm_store_close(srv->store);
+            srv->store = NULL;
+            return NULL;
+        }
+        if (verdict == CBM_INTEGRITY_CORRUPT) {
             cbm_log_error("store.auto_clean", "project", project, "path", path, "action",
                           "backing up corrupt db to .corrupt — re-index required");
             cbm_store_close(srv->store);

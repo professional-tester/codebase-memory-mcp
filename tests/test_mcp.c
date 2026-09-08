@@ -6192,9 +6192,184 @@ TEST(index_repository_honors_allowed_root) {
  *  SUITE
  * ══════════════════════════════════════════════════════════════════ */
 
+/* #1206/#1037: a transient SQLITE_BUSY from a concurrent writer must NOT
+ * quarantine (rename to .corrupt) a healthy per-project db. Old code fed the
+ * lock-induced prepare failure into the plain bool check and renamed the DB
+ * away; the fix classifies the state as transient and leaves the file alone. */
+TEST(mcp_busy_lock_does_not_quarantine_project_db) {
+    char cache[256];
+    snprintf(cache, sizeof(cache), "/tmp/cbm-mcp-busy-quarantine-XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    const char *saved_mode = getenv("CBM_ZOVA_MODE");
+    char *saved_mode_copy = saved_mode ? strdup(saved_mode) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    cbm_setenv("CBM_ZOVA_MODE", "off", 1); /* compatibility per-project .db route */
+
+    /* Healthy per-project db in rollback-journal mode with one project row. */
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/busy-proj.db", cache);
+    sqlite3 *writer = NULL;
+    ASSERT_EQ(sqlite3_open(db_path, &writer), SQLITE_OK);
+    char *err = NULL;
+    ASSERT_EQ(sqlite3_exec(writer,
+                           "PRAGMA journal_mode = DELETE;"
+                           "CREATE TABLE projects ("
+                           "  name TEXT PRIMARY KEY,"
+                           "  indexed_at TEXT NOT NULL,"
+                           "  root_path TEXT NOT NULL"
+                           ");"
+                           "INSERT INTO projects(name, indexed_at, root_path)"
+                           " VALUES('busy-proj', '2026-01-01T00:00:00Z', '/tmp/busy-proj');",
+                           NULL, NULL, &err),
+              SQLITE_OK);
+    sqlite3_free(err);
+    sqlite3_close(writer);
+
+    /* The contender holds the writer lock for the whole resolve. */
+    sqlite3 *locker = NULL;
+    ASSERT_EQ(sqlite3_open(db_path, &locker), SQLITE_OK);
+    ASSERT_EQ(sqlite3_exec(locker, "BEGIN EXCLUSIVE;", NULL, NULL, NULL), SQLITE_OK);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    /* The resolve may stall up to busy_timeout (10s) and is then served via
+     * the immutable-URI read fallback (locks ignored) or refused — either way,
+     * the contract under test is that the DB FILE SURVIVES: a writer conflict
+     * is a transient condition, never a quarantine trigger. */
+    char *resp = cbm_mcp_handle_tool(srv, "index_status", "{\"project\":\"busy-proj\"}");
+    ASSERT_NOT_NULL(resp);
+    free(resp);
+    cbm_mcp_server_free(srv);
+
+    /* THE BUG: old code renamed the locked db to .corrupt (and deleted it when
+     * rename failed). Fixed: the file must still be at its original path and
+     * no .corrupt quarantine artifact may exist. */
+    struct stat st;
+    ASSERT_EQ(stat(db_path, &st), 0);
+    char corrupt_path[540];
+    snprintf(corrupt_path, sizeof(corrupt_path), "%s.corrupt", db_path);
+    ASSERT_TRUE(stat(corrupt_path, &st) != 0);
+
+    ASSERT_EQ(sqlite3_exec(locker, "COMMIT;", NULL, NULL, NULL), SQLITE_OK);
+    sqlite3_close(locker);
+    unlink(db_path);
+    if (saved_cache_copy) {
+        cbm_setenv("CBM_CACHE_DIR", saved_cache_copy, 1);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    if (saved_mode_copy) {
+        cbm_setenv("CBM_ZOVA_MODE", saved_mode_copy, 1);
+    } else {
+        cbm_unsetenv("CBM_ZOVA_MODE");
+    }
+    free(saved_cache_copy);
+    free(saved_mode_copy);
+    cbm_rmdir(cache);
+    PASS();
+}
+
+/* #1037: a DB whose projects table is intact but whose btrees are torn must
+ * be QUARANTINED, not served. The old shallow-only check passed this DB and
+ * resolve_store() served queries against a structurally damaged file; the
+ * verdict runs quick_check and confirms corruption. */
+TEST(mcp_torn_btree_db_is_quarantined_not_served) {
+    char cache[256];
+    snprintf(cache, sizeof(cache), "/tmp/cbm-mcp-torn-quarantine-XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    const char *saved_mode = getenv("CBM_ZOVA_MODE");
+    char *saved_mode_copy = saved_mode ? strdup(saved_mode) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    cbm_setenv("CBM_ZOVA_MODE", "off", 1); /* compatibility per-project .db route */
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/torn-proj.db", cache);
+    sqlite3 *writer = NULL;
+    ASSERT_EQ(sqlite3_open(db_path, &writer), SQLITE_OK);
+    char *err = NULL;
+    /* DELETE journal so the file is self-contained after close; projects table
+     * tiny (page 1), a big filler btree fills the mid-file pages. */
+    ASSERT_EQ(sqlite3_exec(writer,
+                           "PRAGMA journal_mode = DELETE;"
+                           "CREATE TABLE projects ("
+                           "  name TEXT PRIMARY KEY,"
+                           "  indexed_at TEXT NOT NULL,"
+                           "  root_path TEXT NOT NULL"
+                           ");"
+                           "INSERT INTO projects(name, indexed_at, root_path)"
+                           " VALUES('torn-proj', '2026-01-01T00:00:00Z', '/tmp/torn-proj');"
+                           "CREATE TABLE filler(id INTEGER PRIMARY KEY, pad TEXT);",
+                           NULL, NULL, &err),
+              SQLITE_OK);
+    sqlite3_free(err);
+    for (int i = 0; i < 2000; i++) {
+        char sql[320];
+        snprintf(sql, sizeof(sql), "INSERT INTO filler(id, pad) VALUES(%d, '%0198d');", i, i);
+        ASSERT_EQ(sqlite3_exec(writer, sql, NULL, NULL, &err), SQLITE_OK);
+        sqlite3_free(err);
+        err = NULL;
+    }
+    sqlite3_close(writer);
+
+    /* Zero a band of mid-file pages: filler btree leaves torn, projects table
+     * (page 1) intact — exactly the shape the shallow check cannot see. */
+    FILE *f = fopen(db_path, "rb+");
+    ASSERT_NOT_NULL(f);
+    (void)fseek(f, 0, SEEK_END);
+    long fsize = ftell(f);
+    enum { PAGE = 4096, ZERO_PAGES = 40 };
+    long page_count = fsize / PAGE;
+    ASSERT_TRUE(page_count > ZERO_PAGES + 8);
+    char zero[PAGE];
+    memset(zero, 0, sizeof(zero));
+    (void)fseek(f, (page_count / 4) * (long)PAGE, SEEK_SET);
+    for (int i = 0; i < ZERO_PAGES; i++) {
+        ASSERT_EQ(fwrite(zero, 1, PAGE, f), (size_t)PAGE);
+    }
+    (void)fclose(f);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    /* Response is an error (store refused) — and, decisively, the damaged file
+     * is quarantined to .corrupt instead of kept in service. */
+    char *resp = cbm_mcp_handle_tool(srv, "index_status", "{\"project\":\"torn-proj\"}");
+    ASSERT_NOT_NULL(resp);
+    free(resp);
+    cbm_mcp_server_free(srv);
+
+    struct stat st;
+    char corrupt_path[540];
+    snprintf(corrupt_path, sizeof(corrupt_path), "%s.corrupt", db_path);
+    /* no longer served in place; recoverable quarantine copy */
+    ASSERT_TRUE(stat(db_path, &st) != 0);
+    ASSERT_EQ(stat(corrupt_path, &st), 0);
+
+    unlink(corrupt_path);
+    if (saved_cache_copy) {
+        cbm_setenv("CBM_CACHE_DIR", saved_cache_copy, 1);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    if (saved_mode_copy) {
+        cbm_setenv("CBM_ZOVA_MODE", saved_mode_copy, 1);
+    } else {
+        cbm_unsetenv("CBM_ZOVA_MODE");
+    }
+    free(saved_cache_copy);
+    free(saved_mode_copy);
+    cbm_rmdir(cache);
+    PASS();
+}
+
 SUITE(mcp) {
 #if CBM_WITH_ZOVA
     RUN_TEST(mcp_migration_route_is_explicit_and_never_fallback);
+    RUN_TEST(mcp_busy_lock_does_not_quarantine_project_db);
+    RUN_TEST(mcp_torn_btree_db_is_quarantined_not_served);
 #endif
     RUN_TEST(index_job_queue_is_fifo_and_blocks_second_contender);
     RUN_TEST(mcp_path_within_root_rejects_escape);

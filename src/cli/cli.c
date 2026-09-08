@@ -3269,6 +3269,44 @@ int cbm_config_delete(cbm_config_t *cfg, const char *key) {
 
 /* ── Config CLI subcommand ────────────────────────────────────── */
 
+/* Single config-key table driving help, list, get, set, reset
+ * (upstream f59d24fd, #1522 bug 2). list used to print stored-or-DEFAULT
+ * while get printed stored-or-EMPTY, so every unset key (and every typo,
+ * at exit 0) read as "". Defaults mirror the runtime readers' fallbacks;
+ * keep them in sync. */
+typedef struct {
+    const char *key;
+    const char *default_value;
+    const char *help;
+} cbm_config_key_def_t;
+
+static const cbm_config_key_def_t CBM_CONFIG_KEYS[] = {
+    {CBM_CONFIG_AUTO_INDEX, "false", "Enable auto-indexing on MCP session start"},
+    {CBM_CONFIG_AUTO_INDEX_LIMIT, "50000", "Max files for auto-indexing new projects"},
+    {CBM_CONFIG_AUTO_WATCH, "true", "Register background git watcher on session connect"},
+    {CBM_CONFIG_UI_LANG, "auto", "Pin graph UI language: en, zh, or auto"},
+};
+
+static const size_t CBM_CONFIG_KEY_COUNT =
+    sizeof(CBM_CONFIG_KEYS) / sizeof(CBM_CONFIG_KEYS[0]);
+
+static const cbm_config_key_def_t *cbm_config_key_lookup(const char *key) {
+    for (size_t i = 0; key && i < CBM_CONFIG_KEY_COUNT; i++) {
+        if (strcmp(CBM_CONFIG_KEYS[i].key, key) == 0) {
+            return &CBM_CONFIG_KEYS[i];
+        }
+    }
+    return NULL;
+}
+
+static void cbm_config_print_unknown_key(const char *key) {
+    (void)fprintf(stderr, "error: unknown config key: %s\nKnown keys:", key ? key : "");
+    for (size_t i = 0; i < CBM_CONFIG_KEY_COUNT; i++) {
+        (void)fprintf(stderr, " %s", CBM_CONFIG_KEYS[i].key);
+    }
+    (void)fprintf(stderr, "\n");
+}
+
 int cbm_cmd_config(int argc, char **argv) {
     if (argc == 0) {
         printf("Usage: codebase-memory-mcp config <command> [args]\n\n");
@@ -3278,14 +3316,10 @@ int cbm_cmd_config(int argc, char **argv) {
         printf("  set <key> <val>  Set a config value\n");
         printf("  reset <key>      Reset a key to default\n\n");
         printf("Config keys:\n");
-        printf("  %-25s  default=%-10s  %s\n", CBM_CONFIG_AUTO_INDEX, "false",
-               "Enable auto-indexing on MCP session start");
-        printf("  %-25s  default=%-10s  %s\n", CBM_CONFIG_AUTO_INDEX_LIMIT, "50000",
-               "Max files for auto-indexing new projects");
-        printf("  %-25s  default=%-10s  %s\n", CBM_CONFIG_AUTO_WATCH, "true",
-               "Register background git watcher on session connect");
-        printf("  %-25s  default=%-10s  %s\n", CBM_CONFIG_UI_LANG, "auto",
-               "Pin graph UI language: en, zh, or auto");
+        for (size_t i = 0; i < CBM_CONFIG_KEY_COUNT; i++) {
+            printf("  %-25s  default=%-10s  %s\n", CBM_CONFIG_KEYS[i].key,
+                   CBM_CONFIG_KEYS[i].default_value, CBM_CONFIG_KEYS[i].help);
+        }
         return 0;
     }
 
@@ -3307,24 +3341,29 @@ int cbm_cmd_config(int argc, char **argv) {
     int rc = 0;
     if (strcmp(argv[0], "list") == 0 || strcmp(argv[0], "ls") == 0) {
         printf("Configuration:\n");
-        printf("  %-25s = %-10s\n", CBM_CONFIG_AUTO_INDEX,
-               cbm_config_get(cfg, CBM_CONFIG_AUTO_INDEX, "false"));
-        printf("  %-25s = %-10s\n", CBM_CONFIG_AUTO_INDEX_LIMIT,
-               cbm_config_get(cfg, CBM_CONFIG_AUTO_INDEX_LIMIT, "50000"));
-        printf("  %-25s = %-10s\n", CBM_CONFIG_AUTO_WATCH,
-               cbm_config_get(cfg, CBM_CONFIG_AUTO_WATCH, "true"));
-        printf("  %-25s = %-10s\n", CBM_CONFIG_UI_LANG,
-               cbm_config_get(cfg, CBM_CONFIG_UI_LANG, "auto"));
+        for (size_t i = 0; i < CBM_CONFIG_KEY_COUNT; i++) {
+            printf("  %-25s = %-10s\n", CBM_CONFIG_KEYS[i].key,
+                   cbm_config_get(cfg, CBM_CONFIG_KEYS[i].key, CBM_CONFIG_KEYS[i].default_value));
+        }
     } else if (strcmp(argv[0], "get") == 0) {
         if (argc < MIN_ARGC_GET) {
             (void)fprintf(stderr, "Usage: config get <key>\n");
             rc = CLI_TRUE;
         } else {
-            printf("%s\n", cbm_config_get(cfg, argv[CLI_SKIP_ONE], ""));
+            const cbm_config_key_def_t *def = cbm_config_key_lookup(argv[CLI_SKIP_ONE]);
+            if (!def) {
+                cbm_config_print_unknown_key(argv[CLI_SKIP_ONE]);
+                rc = CLI_TRUE;
+            } else {
+                printf("%s\n", cbm_config_get(cfg, def->key, def->default_value));
+            }
         }
     } else if (strcmp(argv[0], "set") == 0) {
         if (argc < MIN_ARGC_CMD) {
             (void)fprintf(stderr, "Usage: config set <key> <value>\n");
+            rc = CLI_TRUE;
+        } else if (!cbm_config_key_lookup(argv[CLI_SKIP_ONE])) {
+            cbm_config_print_unknown_key(argv[CLI_SKIP_ONE]);
             rc = CLI_TRUE;
         } else {
             if (cbm_config_set(cfg, argv[CLI_SKIP_ONE], argv[CLI_PAIR_LEN]) == 0) {
@@ -3337,6 +3376,9 @@ int cbm_cmd_config(int argc, char **argv) {
     } else if (strcmp(argv[0], "reset") == 0) {
         if (argc < MIN_ARGC_GET) {
             (void)fprintf(stderr, "Usage: config reset <key>\n");
+            rc = CLI_TRUE;
+        } else if (!cbm_config_key_lookup(argv[CLI_SKIP_ONE])) {
+            cbm_config_print_unknown_key(argv[CLI_SKIP_ONE]);
             rc = CLI_TRUE;
         } else {
             cbm_config_delete(cfg, argv[CLI_SKIP_ONE]);

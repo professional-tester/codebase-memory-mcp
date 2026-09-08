@@ -439,8 +439,10 @@ TEST(mcp_tools_list_latest_metadata) {
     ASSERT_NOT_NULL(json);
     ASSERT_NOT_NULL(strstr(json, "\"title\":\"Search graph\""));
     ASSERT_NOT_NULL(strstr(json, "\"title\":\"Index repository\""));
-    ASSERT_NOT_NULL(strstr(json, "\"outputSchema\":{\"type\":\"object\""));
-    ASSERT_NOT_NULL(strstr(json, "\"additionalProperties\":true"));
+    /* No tool declares outputSchema (upstream f59d24fd, #1522): output is
+     * format-polymorphic, and a declared schema makes spec-honoring clients
+     * render text replies as "{}". */
+    ASSERT_NULL(strstr(json, "\"outputSchema\""));
     free(json);
     PASS();
 }
@@ -646,6 +648,8 @@ TEST(mcp_text_result_error) {
     ASSERT_NOT_NULL(json);
     ASSERT_NOT_NULL(strstr(json, "\"isError\":true"));
     ASSERT_NOT_NULL(strstr(json, "something failed"));
+    /* Error envelope keeps bounded machine-readable structure (#1522). */
+    ASSERT_NOT_NULL(strstr(json, "\"structuredContent\":{\"error\":\"something failed\"}"));
     free(json);
     PASS();
 }

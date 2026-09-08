@@ -271,6 +271,16 @@ char *cbm_mcp_text_result(const char *text, bool is_error) {
             yyjson_doc_free(structured_doc);
         }
     }
+    if (is_error) {
+        /* Upstream f59d24fd (#1522): errors keep a bounded machine-readable
+         * structuredContent.error. Text payloads carry no structuredContent
+         * key at all (no duplication per f27f0a2a/#1375, no empty {} which
+         * schema-honoring clients render as the whole result). JSON-object
+         * payloads keep the parsed object above. */
+        yyjson_mut_val *structured = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_str(doc, structured, "error", text ? text : "");
+        yyjson_mut_obj_add_val(doc, root, "structuredContent", structured);
+    }
     yyjson_mut_obj_add_bool(doc, root, "isError", is_error);
 
     char *out = yy_doc_to_str(doc);
@@ -514,7 +524,9 @@ static const tool_def_t TOOLS[] = {
 
 static const int TOOL_COUNT = sizeof(TOOLS) / sizeof(TOOLS[0]);
 
-static const char MCP_TOOL_OUTPUT_SCHEMA[] = "{\"type\":\"object\",\"additionalProperties\":true}";
+/* MCP_TOOL_OUTPUT_SCHEMA removed (upstream f59d24fd, #1522): no tool
+ * declares outputSchema; see mcp_add_tool_def. Kept as comment so a future
+ * re-add is a conscious, reviewed decision. */
 
 static void mcp_add_json_schema(yyjson_mut_doc *doc, yyjson_mut_val *obj, const char *key,
                                 const char *schema_json) {
@@ -535,7 +547,13 @@ static void mcp_add_tool_def(yyjson_mut_doc *doc, yyjson_mut_val *tools, int i) 
     yyjson_mut_obj_add_str(doc, tool, "description", TOOLS[i].description);
 
     mcp_add_json_schema(doc, tool, "inputSchema", TOOLS[i].input_schema);
-    mcp_add_json_schema(doc, tool, "outputSchema", MCP_TOOL_OUTPUT_SCHEMA);
+    /* Deliberately no outputSchema (upstream f59d24fd, #1522). Tool output
+     * is format-parameter-polymorphic (tree text by default, JSON object
+     * under format:"json"), so no static schema is truthful — and a declared
+     * schema makes spec-honoring clients read structuredContent as the
+     * authoritative result, rendering every text reply as "{}". The blanket
+     * {"type":"object","additionalProperties":true} it replaced validated
+     * anything and informed nobody. */
 
     yyjson_mut_arr_add_val(tools, tool);
 }

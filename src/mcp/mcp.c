@@ -2033,7 +2033,14 @@ static void emit_search_results(yyjson_mut_doc *doc, yyjson_mut_val *root,
                                 yyjson_doc ***out_pdocs, int *out_pdoc_count) {
     yyjson_doc **pdocs = out->count > 0 ? malloc((size_t)out->count * sizeof(yyjson_doc *)) : NULL;
     int pdoc_count = 0;
-    yyjson_mut_obj_add_int(doc, root, "total", out->total);
+    /* A semantic-only call skips the structural search, so it also skips the
+     * structural envelope (total/results/has_more) — the flagged and catalog
+     * routes emit semantic_results alone, and a mismatched envelope here made
+     * the same request shape differ per storage route. (Issue #25.) */
+    bool structural_ran = out->total > 0 || out->count > 0;
+    if (structural_ran) {
+        yyjson_mut_obj_add_int(doc, root, "total", out->total);
+    }
     yyjson_mut_val *results = yyjson_mut_arr(doc);
     for (int i = 0; i < out->count; i++) {
         cbm_search_result_t *sr = &out->results[i];
@@ -2055,8 +2062,10 @@ static void emit_search_results(yyjson_mut_doc *doc, yyjson_mut_val *root,
         }
         yyjson_mut_arr_add_val(results, item);
     }
-    yyjson_mut_obj_add_val(doc, root, "results", results);
-    yyjson_mut_obj_add_bool(doc, root, "has_more", out->total > offset + out->count);
+    if (structural_ran) {
+        yyjson_mut_obj_add_val(doc, root, "results", results);
+        yyjson_mut_obj_add_bool(doc, root, "has_more", out->total > offset + out->count);
+    }
     *out_pdocs = pdocs;
     *out_pdoc_count = pdoc_count;
 }

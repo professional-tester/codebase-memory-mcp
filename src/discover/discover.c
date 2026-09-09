@@ -455,8 +455,12 @@ static void file_list_add_excluded(file_list_t *fl, const char *rel_path) {
     }
     if (fl->excluded_count >= fl->excluded_cap) {
         int new_cap = fl->excluded_cap ? fl->excluded_cap * PAIR_LEN : CBM_SZ_64;
+        if (discover_test_fail_hit("excluded_grow")) {
+            fl->failed = true;
+            return;
+        }
         char **grown = realloc(fl->excluded, new_cap * sizeof(char *));
-        if (!grown || discover_test_fail_hit("excluded_grow")) {
+        if (!grown) {
             /* Dropped skip-point record — the walk is no longer complete (#17). */
             fl->failed = true;
             return;
@@ -476,8 +480,12 @@ static void fl_add(file_list_t *fl, const char *abs_path, const char *rel_path, 
                    int64_t size) {
     if (fl->count >= fl->capacity) {
         int new_cap = fl->capacity ? fl->capacity * PAIR_LEN : CBM_SZ_256;
+        if (discover_test_fail_hit("files_grow")) {
+            fl->failed = true;
+            return;
+        }
         cbm_file_info_t *new_files = realloc(fl->files, new_cap * sizeof(cbm_file_info_t));
-        if (!new_files || discover_test_fail_hit("files_grow")) {
+        if (!new_files) {
             /* Checked bounds growth (#17): on allocation failure the file is
              * dropped and the walk is flagged incomplete instead of silently
              * indexing a partial view as if it were the whole tree. */
@@ -737,8 +745,12 @@ static void walk_push_subdir(walk_stack_t *ws, const char *abs_path, const char 
                              const walk_frame_t *parent, file_list_t *out) {
     if (ws->top >= ws->cap) {
         int new_cap = ws->cap * 2;
+        if (discover_test_fail_hit("stack_grow")) {
+            out->failed = true;
+            return;
+        }
         walk_frame_t *grown = realloc(ws->frames, (size_t)new_cap * sizeof(*grown));
-        if (!grown || discover_test_fail_hit("stack_grow")) {
+        if (!grown) {
             out->failed = true;
             return;
         }

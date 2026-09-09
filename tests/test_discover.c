@@ -803,8 +803,11 @@ TEST(discover_files_grow_fault_rolls_back_entry) {
     char *base = th_mktempdir("cbm_disc_oom_files");
     ASSERT(base != NULL);
 
-    th_write_file(TH_PATH(base, "early.go"), "package e\n");
-    th_write_file(TH_PATH(base, "sub/late.go"), "package l\n");
+    char file[4096];
+    for (int i = 0; i < 257; i++) {
+        snprintf(file, sizeof(file), "%s/f%03d.go", base, i);
+        ASSERT(th_write_file(file, "package p\n") == 0);
+    }
 
     cbm_setenv("CBM_DISCOVER_TEST_FAIL_PHASE", "files_grow", 1);
     cbm_setenv("CBM_DISCOVER_TEST_FAIL_NTH", "1", 1);
@@ -814,25 +817,53 @@ TEST(discover_files_grow_fault_rolls_back_entry) {
     int count = 0;
     bool degraded = false;
 
-    /* The initial files array starts at CBM_SZ_256, so one file cannot trigger
-     * a grow; force it small by walking a tree that fits in one realloc step:
-     * the fault fires at the FIRST grow (initial 256 → 512), which the 2-file
-     * tree does not reach. Instead verify via the deepest reachable fault:
-     * both files are discovered without any grow, so reset and use the
-     * direct fl_add path through a NULL strdup fault instead. */
-    cbm_unsetenv("CBM_DISCOVER_TEST_FAIL_PHASE");
-    cbm_setenv("CBM_DISCOVER_TEST_FAIL_PHASE", "file_strdup", 1);
     int rc = cbm_discover_ex(base, &opts, &files, &count, NULL, NULL, &degraded);
     cbm_unsetenv("CBM_DISCOVER_TEST_FAIL_PHASE");
     cbm_unsetenv("CBM_DISCOVER_TEST_FAIL_NTH");
     ASSERT_EQ(rc, 0);
-    /* The last attempted file rolled back — no NULL path downstream. */
+    /* The 257th file triggers the 256 -> 512 grow and is rolled back. */
     ASSERT_TRUE(degraded);
-    ASSERT_EQ(count, 1); /* one file survived; the faulted one is absent */
+    ASSERT_EQ(count, 256);
     for (int i = 0; i < count; i++) {
         ASSERT_NOT_NULL(files[i].path);
         ASSERT_NOT_NULL(files[i].rel_path);
     }
+
+    cbm_discover_free(files, count);
+    th_cleanup(base);
+    PASS();
+}
+
+/* A failed stack grow must retain the original allocation and finish safely
+ * with a degraded result. This catches fault injection performed after a
+ * successful realloc, which would otherwise discard the moved pointer. */
+TEST(discover_stack_grow_fault_preserves_allocation) {
+    char *base = th_mktempdir("cbm_disc_oom_stack_grow");
+    ASSERT(base != NULL);
+
+    char dir[4096];
+    char file[4200];
+    for (int i = 0; i < 513; i++) {
+        snprintf(dir, sizeof(dir), "%s/d%03d", base, i);
+        ASSERT(th_mkdir_p(dir) == 0);
+        snprintf(file, sizeof(file), "%s/f.go", dir);
+        ASSERT(th_write_file(file, "package p\n") == 0);
+    }
+
+    cbm_setenv("CBM_DISCOVER_TEST_FAIL_PHASE", "stack_grow", 1);
+    cbm_setenv("CBM_DISCOVER_TEST_FAIL_NTH", "1", 1);
+
+    cbm_discover_opts_t opts = {0};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+    bool degraded = false;
+    int rc = cbm_discover_ex(base, &opts, &files, &count, NULL, NULL, &degraded);
+
+    cbm_unsetenv("CBM_DISCOVER_TEST_FAIL_PHASE");
+    cbm_unsetenv("CBM_DISCOVER_TEST_FAIL_NTH");
+    ASSERT_EQ(rc, 0);
+    ASSERT_TRUE(degraded);
+    ASSERT_EQ(count, 512);
 
     cbm_discover_free(files, count);
     th_cleanup(base);
@@ -1602,6 +1633,7 @@ SUITE(discover) {
     RUN_TEST(discover_stack_grows_repeatedly);
     RUN_TEST(discover_wide_fanout_keeps_nested_gitignores);
     RUN_TEST(discover_files_grow_fault_rolls_back_entry);
+    RUN_TEST(discover_stack_grow_fault_preserves_allocation);
     RUN_TEST(discover_excluded_grow_fault_degrades_walk);
     RUN_TEST(discover_stack_calloc_fault_flags_empty_result);
     RUN_TEST(discover_not_degraded_on_complete_walk);

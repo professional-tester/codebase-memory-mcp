@@ -543,6 +543,35 @@ static bool is_safety_core_dir(const char *name) {
 }
 
 /* Check if a directory entry should be skipped (hardcoded dirs + gitignore). */
+
+/* The shared cache directory holds every indexed workspace's database and the
+ * CBM internal files. A custom CBM_CACHE_DIR may legitimately sit inside a
+ * repository — tests do it routinely, and nothing forbids it in production —
+ * and walking into it would pull other workspaces' databases and cache state
+ * into this project's file list. "cache" is deliberately not on the built-in
+ * skip list (it is a common source directory name), so the walk prunes the
+ * configured cache tree by absolute path instead.
+ *
+ * This is the narrow remedy for the boundary concern in #17 ("never traverse
+ * the shared CBM cache/database as repository input"): refusing any root that
+ * contains the cache was considered and rejected as too blunt — not walking
+ * the cache is what the boundary actually asks for. (Upstream 7814dacf.) */
+static bool dir_is_cache_tree(const char *abs_path) {
+    const char *cache = cbm_resolve_cache_dir();
+    if (!cache || !cache[0] || !abs_path || !abs_path[0]) {
+        return false;
+    }
+    size_t n = strlen(cache);
+    while (n > 1 && (cache[n - 1] == '/' || cache[n - 1] == '\\')) {
+        n--;
+    }
+    if (n == 0 || strncmp(abs_path, cache, n) != 0) {
+        return false;
+    }
+    /* Boundary-aware so "<cache>x" is not treated as living under "<cache>". */
+    return abs_path[n] == '\0' || abs_path[n] == '/' || abs_path[n] == '\\';
+}
+
 static bool should_skip_directory(const char *entry_name, const char *rel_path,
                                   const cbm_discover_opts_t *opts, const cbm_gitignore_t *gitignore,
                                   const cbm_gitignore_t *global_gi,
@@ -796,7 +825,8 @@ static void walk_dir_process_entry(cbm_dirent_t *entry, const walk_frame_t *fram
     }
 
     if (S_ISDIR(st.st_mode)) {
-        if (!should_skip_directory(entry->name, rel_path, opts, gitignore, global_gi, cbmignore,
+        if (!dir_is_cache_tree(abs_path) &&
+            !should_skip_directory(entry->name, rel_path, opts, gitignore, global_gi, cbmignore,
                                    frame->local_gi, frame->local_gi_prefix)) {
             walk_push_subdir(ws, abs_path, rel_path, frame, out);
         } else {

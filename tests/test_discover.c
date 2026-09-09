@@ -899,6 +899,84 @@ TEST(discover_excluded_grow_fault_degrades_walk) {
     PASS();
 }
 
+/* A custom CBM_CACHE_DIR may legitimately sit inside a repository — tests do it
+ * routinely, and nothing forbids it in production. Walking into it would pull
+ * other workspaces' databases and cache state into this project's file list
+ * (#17 boundary: never traverse the shared CBM cache as repository input).
+ * "cache" is deliberately not on the built-in skip list, so the walk prunes
+ * the configured cache tree by absolute path (upstream 7814dacf). */
+TEST(discover_prunes_the_cache_tree) {
+    char *base = th_mktempdir("cbm_disc_cache");
+    ASSERT(base != NULL);
+
+    th_write_file(TH_PATH(base, "src/main.go"), "package main\n");
+    /* Source-looking files inside the cache must not be discovered. */
+    th_write_file(TH_PATH(base, "cache/other_workspace/leaked.go"), "package leaked\n");
+
+    const char *saved = getenv("CBM_CACHE_DIR");
+    char *saved_copy = saved ? strdup(saved) : NULL;
+    char cache_dir[1024];
+    snprintf(cache_dir, sizeof(cache_dir), "%s/cache", base);
+    cbm_setenv("CBM_CACHE_DIR", cache_dir, 1);
+
+    cbm_discover_opts_t opts = {0};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+    int rc = cbm_discover(base, &opts, &files, &count);
+
+    if (saved_copy) {
+        cbm_setenv("CBM_CACHE_DIR", saved_copy, 1);
+        free(saved_copy);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+
+    ASSERT_EQ(rc, 0);
+    for (int i = 0; i < count; i++) {
+        ASSERT(strstr(files[i].rel_path, "leaked.go") == NULL);
+    }
+    ASSERT_EQ(count, 1); /* only src/main.go */
+
+    cbm_discover_free(files, count);
+    th_cleanup(base);
+    PASS();
+}
+
+/* The cache prune must not swallow a directory that merely shares a prefix:
+ * "<cache>-alt" is a sibling, not a child of "<cache>". */
+TEST(discover_cache_prune_is_boundary_aware) {
+    char *base = th_mktempdir("cbm_disc_cachebx");
+    ASSERT(base != NULL);
+
+    th_write_file(TH_PATH(base, "src/main.go"), "package main\n");
+    th_write_file(TH_PATH(base, "cache-alt/kept.go"), "package kept\n");
+
+    const char *saved = getenv("CBM_CACHE_DIR");
+    char *saved_copy = saved ? strdup(saved) : NULL;
+    char cache_dir[1024];
+    snprintf(cache_dir, sizeof(cache_dir), "%s/cache", base);
+    cbm_setenv("CBM_CACHE_DIR", cache_dir, 1);
+
+    cbm_discover_opts_t opts = {0};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+    int rc = cbm_discover(base, &opts, &files, &count);
+
+    if (saved_copy) {
+        cbm_setenv("CBM_CACHE_DIR", saved_copy, 1);
+        free(saved_copy);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(count, 2); /* src/main.go AND cache-alt/kept.go survive */
+
+    cbm_discover_free(files, count);
+    th_cleanup(base);
+    PASS();
+}
+
 /* A walk-stack calloc fault degrades to an empty-but-flagged result: the
  * caller must not mistake the empty file list for an empty tree. */
 TEST(discover_stack_calloc_fault_flags_empty_result) {
@@ -1627,6 +1705,10 @@ SUITE(discover) {
     /* Nested .gitignore tests (issue #178) */
     RUN_TEST(discover_nested_gitignore);
     RUN_TEST(discover_nested_gitignore_stacks_with_root);
+
+    /* Cache-tree pruning (#17 boundary / upstream 7814dacf) */
+    RUN_TEST(discover_prunes_the_cache_tree);
+    RUN_TEST(discover_cache_prune_is_boundary_aware);
 
     /* Wide-directory discovery (growing walk stack, #17 / upstream 03dc9c91) */
     RUN_TEST(discover_wide_fanout_indexed_completely);

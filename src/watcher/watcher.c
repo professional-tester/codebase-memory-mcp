@@ -38,9 +38,15 @@
 typedef struct {
     char *project_name;
     char *root_path;
-    char last_head[CBM_SZ_64]; /* git HEAD hash */
+    char last_head[CBM_SZ_64]; /* git HEAD hash (last SUCCESSFULLY indexed) */
     bool is_git;               /* false → skip polling */
     bool baseline_done;        /* true after first poll */
+    /* Detected-but-not-yet-indexed HEAD movement (#17, item 3): the observed
+     * head is committed to last_head only after a successful refresh, so a
+     * failed index keeps retry eligibility and a newer change arriving during
+     * indexing stays pending instead of being swallowed. */
+    bool change_pending;
+    char pending_head[CBM_SZ_64];
     int missing_root_count;    /* consecutive polls where root was missing (ENOENT/ENOTDIR) */
     uint64_t first_missing_ms; /* cbm_now_ms() of the streak's first miss (0 = no streak) */
     int file_count;            /* approximate, for interval calc */
@@ -508,7 +514,15 @@ static void init_baseline(project_state_t *s) {
     s->next_poll_ns = now_ns() + ((int64_t)s->interval_ms * US_PER_MS);
 }
 
-/* Check if a project has changes. Returns true if reindex needed. */
+/* Check if a project has changes. Returns true if reindex needed.
+ *
+ * HEAD movements are recorded as PENDING, not handled (#17 item 3): the
+ * observed head lands in pending_head and is committed to last_head only
+ * after the index refresh succeeds (poll_project). Consequences:
+ *   - A failed index keeps the movement pending → retry next poll.
+ *   - Further movements while pending coalesce into the newest observed head
+ *     (one retry covers them all — identical events are not re-queued).
+ * Dirty-worktree detection is stateless, so it already retries naturally. */
 static bool check_changes(project_state_t *s) {
     if (!s->is_git) {
         return false;
@@ -517,9 +531,17 @@ static bool check_changes(project_state_t *s) {
     /* Check HEAD movement */
     char head[CBM_SZ_64] = {0};
     if (git_head(s->root_path, head, sizeof(head)) == 0) {
+        if (s->change_pending) {
+            /* Coalesce: while a change awaits successful refresh, track the
+             * newest observed head so one retry indexes the latest state. */
+            snprintf(s->pending_head, sizeof(s->pending_head), "%s", head);
+            return true;
+        }
         if (s->last_head[0] != '\0' && strcmp(head, s->last_head) != 0) {
-            /* HEAD moved — commit, checkout, pull */
-            strncpy(s->last_head, head, sizeof(s->last_head) - 1);
+            /* HEAD moved — commit, checkout, pull. Record as pending; do NOT
+             * touch last_head until the reindex succeeds. */
+            snprintf(s->pending_head, sizeof(s->pending_head), "%s", head);
+            s->change_pending = true;
             return true;
         }
         strncpy(s->last_head, head, sizeof(s->last_head) - 1);
@@ -637,13 +659,23 @@ static void poll_project(const char *key, void *val, void *ud) {
         int rc = ctx->w->index_fn(s->project_name, s->root_path, ctx->w->user_data);
         if (rc == 0) {
             ctx->reindexed++;
-            /* Update HEAD after successful reindex */
-            git_head(s->root_path, s->last_head, sizeof(s->last_head));
+            /* Mark handled only after successful refresh (#17 item 3): commit
+             * the OBSERVED pending head, never the current HEAD — a newer
+             * change that arrived while indexing must stay detectable on the
+             * next poll instead of being silently swallowed. */
+            if (s->change_pending) {
+                strncpy(s->last_head, s->pending_head, sizeof(s->last_head) - 1);
+                s->last_head[sizeof(s->last_head) - 1] = '\0';
+                s->change_pending = false;
+                s->pending_head[0] = '\0';
+            }
             /* Refresh file count for interval */
             s->file_count = git_file_count(s->root_path);
             s->interval_ms = cbm_watcher_poll_interval_ms(s->file_count);
         } else {
-            cbm_log_warn("watcher.index.err", "project", s->project_name);
+            /* Keep the change pending: last_head still holds the previously
+             * indexed head, so the next poll re-detects and retries. */
+            cbm_log_warn("watcher.index.err", "project", s->project_name, "retry", "pending");
         }
     }
 

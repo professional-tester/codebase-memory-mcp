@@ -163,6 +163,37 @@ static int index_callback(const char *name, const char *path, void *ud) {
     return 0;
 }
 
+/* Fail the first N calls, then succeed — for retry-eligibility fixtures.
+ * N=1 covers the classic "first attempt fails, retry succeeds" flow.
+ * Counts each attempt exactly once (does NOT chain into index_callback,
+ * which would double-count successes). */
+static int index_fail_remaining = 0;
+static int index_callback_fail_first(const char *name, const char *path, void *ud) {
+    (void)name;
+    (void)path;
+    (void)ud;
+    index_call_count++;
+    if (index_fail_remaining > 0) {
+        index_fail_remaining--;
+        return -1;
+    }
+    return 0;
+}
+
+/* Succeed, but commit a new git change DURING the reindex — simulates a
+ * change arriving while the pipeline runs. */
+static int index_callback_during_index_commit(const char *name, const char *path, void *ud) {
+    int rc = index_callback(name, path, ud);
+    if (rc == 0 && name && path) {
+        char p[1024];
+        snprintf(p, sizeof(p), "%s/during.txt", path);
+        th_write_file(p, "during\n");
+        wt_git(path, "add during.txt");
+        wt_git(path, "commit -q -m during");
+    }
+    return rc;
+}
+
 TEST(watcher_poll_no_projects) {
     cbm_store_t *store = cbm_store_open_memory();
     cbm_watcher_t *w = cbm_watcher_new(store, index_callback, NULL);
@@ -594,6 +625,169 @@ TEST(watcher_detects_new_file) {
     ASSERT_EQ(index_call_count, 1); /* should detect untracked file */
 
     /* Cleanup */
+    cbm_watcher_free(w);
+    cbm_store_close(store);
+    th_rmtree(tmpdir);
+    PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ *  REFRESH STATE MACHINE (#17 item 3)
+ *  A change is handled only after successful refresh; identical events
+ *  coalesce while pending; failed indexes keep retry eligibility.
+ * ══════════════════════════════════════════════════════════════════ */
+
+/* Failed index must NOT consume the change: next poll retries. */
+TEST(watcher_failed_index_keeps_change_pending) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_pend_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+    if (wt_git(tmpdir, "init -q") != 0) {
+        th_rmtree(tmpdir);
+        FAIL("git init failed");
+    }
+    {
+        char p[300];
+        th_write_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "hello\n");
+    }
+    wt_git(tmpdir, "add file.txt");
+    wt_git(tmpdir, "commit -q -m init");
+
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *w = cbm_watcher_new(store, index_callback_fail_first, NULL);
+    cbm_watcher_watch(w, "pend-repo", tmpdir);
+    index_call_count = 0;
+    index_fail_remaining = 1;
+
+    cbm_watcher_poll_once(w); /* baseline */
+    ASSERT_EQ(index_call_count, 0);
+
+    /* Move HEAD: watcher detects the change and calls index_fn, which fails. */
+    {
+        char p[300];
+        th_append_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "world\n");
+    }
+    wt_git(tmpdir, "add file.txt");
+    wt_git(tmpdir, "commit -q -m change");
+
+    cbm_watcher_touch(w, "pend-repo");
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 1); /* attempted once, failed */
+
+    /* No further repo changes — but the change must still be pending: the
+     * retry succeeds (fail budget exhausted) and consumes the change. */
+    cbm_watcher_touch(w, "pend-repo");
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 2); /* retried without a new event, succeeded */
+
+    /* Quiescent poll: no further attempts. */
+    cbm_watcher_touch(w, "pend-repo");
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 2);
+
+    cbm_watcher_free(w);
+    cbm_store_close(store);
+    th_rmtree(tmpdir);
+    PASS();
+}
+
+/* Two commits landing between polls coalesce into ONE reindex, and the
+ * reindex covers the NEWEST head (not the first movement). */
+TEST(watcher_pending_changes_coalesce_to_newest_head) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_coal_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+    if (wt_git(tmpdir, "init -q") != 0) {
+        th_rmtree(tmpdir);
+        FAIL("git init failed");
+    }
+    {
+        char p[300];
+        th_write_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "v1\n");
+    }
+    wt_git(tmpdir, "add file.txt");
+    wt_git(tmpdir, "commit -q -m v1");
+
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *w = cbm_watcher_new(store, index_callback_fail_first, NULL);
+    cbm_watcher_watch(w, "coal-repo", tmpdir);
+    index_call_count = 0;
+    index_fail_remaining = 1;
+
+    cbm_watcher_poll_once(w); /* baseline */
+
+    /* First movement: detected, index attempt fails. */
+    {
+        char p[300];
+        th_append_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "v2\n");
+    }
+    wt_git(tmpdir, "add file.txt");
+    wt_git(tmpdir, "commit -q -m v2");
+    cbm_watcher_touch(w, "coal-repo");
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 1); /* failed attempt */
+
+    /* Second movement arrives while the first is still pending. */
+    {
+        char p[300];
+        th_append_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "v3\n");
+    }
+    wt_git(tmpdir, "add file.txt");
+    wt_git(tmpdir, "commit -q -m v3");
+
+    cbm_watcher_touch(w, "coal-repo");
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 2); /* ONE retry coalescing both movements */
+
+    cbm_watcher_free(w);
+    cbm_store_close(store);
+    th_rmtree(tmpdir);
+    PASS();
+}
+
+/* A change committed DURING a successful reindex must remain pending —
+ * the refresh commits the observed head, not the current one. */
+TEST(watcher_change_during_index_stays_pending) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_race_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+    if (wt_git(tmpdir, "init -q") != 0) {
+        th_rmtree(tmpdir);
+        FAIL("git init failed");
+    }
+    {
+        char p[300];
+        th_write_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "v1\n");
+    }
+    wt_git(tmpdir, "add file.txt");
+    wt_git(tmpdir, "commit -q -m v1");
+
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *w = cbm_watcher_new(store, index_callback_during_index_commit, NULL);
+    cbm_watcher_watch(w, "race-repo", tmpdir);
+    index_call_count = 0;
+
+    cbm_watcher_poll_once(w); /* baseline */
+
+    /* Move HEAD, then poll: index_fn commits ANOTHER change while running. */
+    {
+        char p[300];
+        th_append_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "v2\n");
+    }
+    wt_git(tmpdir, "add file.txt");
+    wt_git(tmpdir, "commit -q -m v2");
+    cbm_watcher_touch(w, "race-repo");
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 1); /* v2 indexed; callback committed v3 */
+
+    /* v3 was NOT indexed: next poll must re-detect it. */
+    cbm_watcher_touch(w, "race-repo");
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 2);
+
     cbm_watcher_free(w);
     cbm_store_close(store);
     th_rmtree(tmpdir);
@@ -1961,6 +2155,12 @@ SUITE(watcher) {
     RUN_TEST(watcher_watch_unwatch_rapid_cycle);
     RUN_TEST(watcher_unwatch_drains_pending_free);
     RUN_TEST(watcher_callback_data_passed);
+
+    /* Refresh state machine (#17 item 3): handled only after successful
+     * refresh, coalescing, retry eligibility, mid-index changes stay pending */
+    RUN_TEST(watcher_failed_index_keeps_change_pending);
+    RUN_TEST(watcher_pending_changes_coalesce_to_newest_head);
+    RUN_TEST(watcher_change_during_index_stays_pending);
     RUN_TEST(watcher_null_poll_once);
     RUN_TEST(watcher_null_watch_count);
 }

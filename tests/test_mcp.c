@@ -906,6 +906,47 @@ TEST(tool_search_graph_basic) {
     PASS();
 }
 
+/* A semantic-only search_graph call (semantic_query, no structural filter)
+ * must not also run the UNFILTERED structural search: that prepended up to
+ * `limit` unrelated enriched nodes to a purely semantic request. Covers both
+ * default and JSON output. (Issue #25 / upstream 108740d8.) */
+static char *extract_text_content(const char *mcp_result);
+
+TEST(tool_search_graph_semantic_only_skips_structural_results_issue1295) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *proj = "semantic-only";
+    cbm_mcp_server_set_project(srv, proj);
+    ASSERT_EQ(cbm_store_upsert_project(st, proj, "/tmp/semantic-only"), CBM_STORE_OK);
+
+    cbm_node_t unrelated = {.project = proj,
+                            .label = "Function",
+                            .name = "unrelated_node",
+                            .qualified_name = "semantic-only.unrelated_node",
+                            .file_path = "unrelated.c",
+                            .start_line = 1,
+                            .end_line = 2};
+    ASSERT_GT(cbm_store_upsert_node(st, &unrelated), 0);
+
+    char *resp = cbm_mcp_handle_tool(
+        srv, "search_graph",
+        "{\"project\":\"semantic-only\",\"semantic_query\":[\"publish\"],\"limit\":5}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NULL(strstr(resp, "unrelated_node"));
+    free(resp);
+
+    resp = cbm_mcp_handle_tool(
+        srv, "search_graph",
+        "{\"project\":\"semantic-only\",\"semantic_query\":[\"publish\"],\"limit\":5}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NULL(strstr(resp, "unrelated_node"));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 TEST(search_graph_schema_accepts_project_or_projects) {
     const char *schema = cbm_mcp_tool_input_schema("search_graph");
     ASSERT_NOT_NULL(schema);
@@ -1437,20 +1478,26 @@ TEST(tool_search_graph_flagged_reads_user_database_without_project_db) {
     ASSERT_TRUE(has_qn);
     ASSERT_TRUE(has_properties);
     ASSERT_TRUE(has_vector_result);
-    ASSERT_NOT_NULL(strstr(vector_response,
-                           "\"results\":[{\"name\":\"aardvark\","
-                           "\"qualified_name\":\"fixture.aaa\""));
-    const char *aardvark_result = strstr(vector_response, "aardvark");
+    /* Semantic-only (no structural filter) must NOT run the unfiltered
+     * structural search — no "results" array, only "semantic_results".
+     * (Issue #25 / upstream 108740d8.) The score formatting guard below
+     * still applies to the semantic result payload. */
+    ASSERT_NULL(strstr(vector_response, "\"results\":[{\"name\":\"aardvark\","));
+    /* Inspect the re-serialized inner JSON payload: the semantic payload must
+     * carry at least one aardvark hit, and any score field must be rounded to
+     * at most 12 decimal places (emit_semantic_results contract). */
+    char *vector_inner = mcp_normalized_tool_payload(vector_response, false);
+    ASSERT_NOT_NULL(vector_inner);
+    const char *aardvark_result = strstr(vector_inner, "aardvark");
     ASSERT_NOT_NULL(aardvark_result);
-    aardvark_result = strstr(aardvark_result + 1, "aardvark");
-    ASSERT_NOT_NULL(aardvark_result);
-    const char *aardvark_score = strstr(aardvark_result, "\\\"score\\\":");
+    const char *aardvark_score = strstr(aardvark_result, "score");
     ASSERT_NOT_NULL(aardvark_score);
     const char *score_dot = strchr(aardvark_score, '.');
     const char *score_end = score_dot ? strpbrk(score_dot, ",}") : NULL;
     ASSERT_NOT_NULL(score_dot);
     ASSERT_NOT_NULL(score_end);
     ASSERT_TRUE((score_end - score_dot - 1) <= 12);
+    free(vector_inner);
     ASSERT_TRUE(has_code);
     ASSERT_TRUE(has_snippet);
     ASSERT_TRUE(has_status);
@@ -6500,6 +6547,7 @@ SUITE(mcp) {
     RUN_TEST(tool_get_graph_schema_empty);
     RUN_TEST(tool_unknown_tool);
     RUN_TEST(tool_search_graph_basic);
+    RUN_TEST(tool_search_graph_semantic_only_skips_structural_results_issue1295);
     RUN_TEST(search_graph_schema_accepts_project_or_projects);
     RUN_TEST(tool_search_graph_rejects_project_and_projects);
     RUN_TEST(tool_search_graph_rejects_empty_projects);

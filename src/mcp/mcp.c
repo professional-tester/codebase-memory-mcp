@@ -2123,10 +2123,21 @@ static char *handle_search_graph_flagged(const char *args, char *project) {
         .max_degree = cbm_mcp_get_int_arg(args, "max_degree", CBM_NOT_FOUND),
     };
     cbm_search_output_t out = {0};
-    int rc = query && query[0]
-                 ? cbm_zova_repository_search_fts(repo, workspace_id, query, file_pattern, params.limit,
-                                                  params.offset, &out)
-                 : cbm_zova_repository_search(repo, workspace_id, &params, &out);
+    /* Semantic-only calls skip the structural search: with no structural
+     * filter, running the UNFILTERED regex search would prepend unrelated
+     * enriched nodes to a purely semantic request — same gate as the
+     * compatibility route. (Upstream 108740d8.) */
+    bool has_structural_filters = name_pattern || qn_pattern || label || file_pattern ||
+                                  relationship ||
+                                  params.min_degree != CBM_NOT_FOUND ||
+                                  params.max_degree != CBM_NOT_FOUND;
+    int rc = CBM_STORE_OK;
+    if (query && query[0]) {
+        rc = cbm_zova_repository_search_fts(repo, workspace_id, query, file_pattern,
+                                            params.limit, params.offset, &out);
+    } else if (has_structural_filters) {
+        rc = cbm_zova_repository_search(repo, workspace_id, &params, &out);
+    }
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root = yyjson_mut_obj(doc);
     yyjson_mut_doc_set_root(doc, root);
@@ -2135,7 +2146,7 @@ static char *handle_search_graph_flagged(const char *args, char *project) {
     if (rc == CBM_STORE_OK) {
         if (query && query[0]) {
             emit_flagged_fts_results(doc, root, &out, offset);
-        } else {
+        } else if (has_structural_filters) {
             emit_search_results(doc, root, &out, NULL, relationship, false, offset,
                                 &props_docs, &props_doc_count);
         }
@@ -2514,6 +2525,14 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     int min_degree = cbm_mcp_get_int_arg(args, "min_degree", CBM_NOT_FOUND);
     int max_degree = cbm_mcp_get_int_arg(args, "max_degree", CBM_NOT_FOUND);
 
+    /* Structural filters present? A semantic_query with NO structural filter
+     * must not also run the UNFILTERED regex search: that prepended up to
+     * `limit` unrelated enriched nodes to a purely semantic request. The
+     * flagged (full-authority) path has the same gate. (Upstream 108740d8.) */
+    bool has_structural_filters = label || name_pattern || qn_pattern || file_pattern ||
+                                  relationship || exclude_entry_points ||
+                                  min_degree != CBM_NOT_FOUND || max_degree != CBM_NOT_FOUND;
+
     if (relationship && !validate_edge_type(relationship)) {
         free(project);
         free(label);
@@ -2540,7 +2559,9 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     };
 
     cbm_search_output_t out = {0};
-    cbm_store_search(store, &params, &out);
+    if (has_structural_filters) {
+        cbm_store_search(store, &params, &out);
+    }
 
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root = yyjson_mut_obj(doc);
@@ -2551,8 +2572,10 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     emit_search_results(doc, root, &out, store, relationship, include_connected, offset,
                         &props_docs, &props_doc_count);
 
-    /* Add diagnostic hint when zero results */
-    if (out.total == 0) {
+    /* Add diagnostic hint when zero results — only meaningful when the
+     * structural search actually ran (a semantic-only request legitimately
+     * has zero structural results). */
+    if (has_structural_filters && out.total == 0) {
         if (name_pattern && label) {
             yyjson_mut_obj_add_str(
                 doc, root, "hint",

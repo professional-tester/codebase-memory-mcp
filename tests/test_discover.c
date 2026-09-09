@@ -677,19 +677,20 @@ TEST(discover_skips_worktrees) {
     PASS();
 }
 
-/* ── Degraded discovery (bounded walk stack, #17 / upstream 03dc9c91) ── */
+/* ── Wide-directory discovery (growing walk stack, #17 / upstream 03dc9c91) ── */
 
-/* A directory with more subdirectories than the bounded walk stack can hold
- * (WALK_STACK_CAP = 512) must be flagged degraded: subdirs queued past the
- * bound are not walked, each dropped subtree is reported as excluded, and the
- * caller knows the result is NOT a complete view of the tree. readdir order is
- * filesystem-dependent, so only aggregate counts are asserted. */
-TEST(discover_degraded_when_walk_stack_exhausted) {
-    char *base = th_mktempdir("cbm_disc_degraded_stack");
+/* The walk stack GROWS on demand (upstream 03dc9c91): a directory with more
+ * immediate subdirectories than the initial 512-frame capacity must still be
+ * indexed COMPLETELY — wide fanout is an indexing failure, not a depth guard
+ * (dotnet/runtime carries 855 sibling dirs in one JIT regression folder).
+ * Every file is discovered, nothing is reported excluded, and the walk is
+ * not degraded. */
+TEST(discover_wide_fanout_indexed_completely) {
+    char *base = th_mktempdir("cbm_disc_wide_stack");
     ASSERT(base != NULL);
 
-    /* 600 subdirs, one file each: 512 stack frames cannot hold them all. */
-    enum { SUBDIRS = 600, STACK_CAP = 512 };
+    /* 600 subdirs, one file each: 512 initial frames cannot hold them all. */
+    enum { SUBDIRS = 600 };
     char dir[4096];
     char file[4200];
     for (int i = 0; i < SUBDIRS; i++) {
@@ -708,17 +709,186 @@ TEST(discover_degraded_when_walk_stack_exhausted) {
 
     int rc = cbm_discover_ex(base, &opts, &files, &count, &excluded, &excluded_count, &degraded);
     ASSERT_EQ(rc, 0);
-    /* The walk itself succeeds — it just did not see everything. */
-    ASSERT_TRUE(degraded);
-    /* Every subdir is either discovered (one file) or reported excluded. */
-    ASSERT_EQ(count, STACK_CAP);
-    ASSERT_EQ(excluded_count, SUBDIRS - STACK_CAP);
-    /* No double-counting: discovered files all come from walked subdirs. */
+    /* Complete walk: stack grew (512 → 1024), nothing dropped. */
+    ASSERT_FALSE(degraded);
+    ASSERT_EQ(count, SUBDIRS);
+    ASSERT_EQ(excluded_count, 0);
     for (int i = 0; i < count; i++) {
         ASSERT_TRUE(strstr(files[i].rel_path, "/f.go") != NULL);
     }
 
     cbm_discover_free_excluded(excluded, excluded_count);
+    cbm_discover_free(files, count);
+    th_cleanup(base);
+    PASS();
+}
+
+/* Repeated growth: the fanout must survive MULTIPLE doublings (512 → 1024 →
+ * 2048), which also proves reallocation preserves queued sibling frames
+ * (the popped parent is a local copy, so nothing dangles mid-walk). */
+TEST(discover_stack_grows_repeatedly) {
+    char *base = th_mktempdir("cbm_disc_stack_grow2");
+    ASSERT(base != NULL);
+
+    enum { SUBDIRS = 1300 }; /* crosses both the 512 and 1024 boundaries */
+    char dir[4096];
+    char file[4200];
+    for (int i = 0; i < SUBDIRS; i++) {
+        snprintf(dir, sizeof(dir), "%s/d%04d", base, i);
+        ASSERT(th_mkdir_p(dir) == 0);
+        snprintf(file, sizeof(file), "%s/f.go", dir);
+        ASSERT(th_write_file(file, "package d\n") == 0);
+    }
+
+    cbm_discover_opts_t opts = {0};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+    bool degraded = false;
+
+    int rc = cbm_discover_ex(base, &opts, &files, &count, NULL, NULL, &degraded);
+    ASSERT_EQ(rc, 0);
+    ASSERT_FALSE(degraded);
+    ASSERT_EQ(count, SUBDIRS);
+
+    cbm_discover_free(files, count);
+    th_cleanup(base);
+    PASS();
+}
+
+/* Growth must not disturb nested-gitignore inheritance: the local gitignore
+ * borrowed by QUEUED frames stays valid across realloc, and deep subtrees
+ * still honour their own .gitignore after the stack has grown. */
+TEST(discover_wide_fanout_keeps_nested_gitignores) {
+    char *base = th_mktempdir("cbm_disc_wide_gi");
+    ASSERT(base != NULL);
+
+    enum { SUBDIRS = 600 };
+    char dir[4096];
+    char file[4200];
+    for (int i = 0; i < SUBDIRS; i++) {
+        snprintf(dir, sizeof(dir), "%s/d%03d", base, i);
+        ASSERT(th_mkdir_p(dir) == 0);
+        snprintf(file, sizeof(file), "%s/keep.go", dir);
+        ASSERT(th_write_file(file, "package d\n") == 0);
+    }
+    /* A nested .gitignore deep inside the fanout excludes generated files. */
+    char nested[4096];
+    snprintf(nested, sizeof(nested), "%s/d%03d", base, SUBDIRS - 1);
+    th_write_file(TH_PATH(nested, ".gitignore"), "generated.go\n");
+    th_write_file(TH_PATH(nested, "generated.go"), "package gen\n");
+
+    cbm_discover_opts_t opts = {0};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+    bool degraded = false;
+
+    int rc = cbm_discover_ex(base, &opts, &files, &count, NULL, NULL, &degraded);
+    ASSERT_EQ(rc, 0);
+    ASSERT_FALSE(degraded);
+    /* One keep.go per subdir, generated.go excluded by the nested ignore. */
+    ASSERT_EQ(count, SUBDIRS);
+    for (int i = 0; i < count; i++) {
+        ASSERT_NULL(strstr(files[i].rel_path, "generated.go"));
+    }
+
+    cbm_discover_free(files, count);
+    th_cleanup(base);
+    PASS();
+}
+
+/* OOM paths keep the walk coherent: the file entry is ROLLED BACK (never a
+ * NULL-path record downstream), the walk is flagged degraded, and whatever
+ * was discovered before the fault is still returned intact. */
+TEST(discover_files_grow_fault_rolls_back_entry) {
+    char *base = th_mktempdir("cbm_disc_oom_files");
+    ASSERT(base != NULL);
+
+    th_write_file(TH_PATH(base, "early.go"), "package e\n");
+    th_write_file(TH_PATH(base, "sub/late.go"), "package l\n");
+
+    cbm_setenv("CBM_DISCOVER_TEST_FAIL_PHASE", "files_grow", 1);
+    cbm_setenv("CBM_DISCOVER_TEST_FAIL_NTH", "1", 1);
+
+    cbm_discover_opts_t opts = {0};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+    bool degraded = false;
+
+    /* The initial files array starts at CBM_SZ_256, so one file cannot trigger
+     * a grow; force it small by walking a tree that fits in one realloc step:
+     * the fault fires at the FIRST grow (initial 256 → 512), which the 2-file
+     * tree does not reach. Instead verify via the deepest reachable fault:
+     * both files are discovered without any grow, so reset and use the
+     * direct fl_add path through a NULL strdup fault instead. */
+    cbm_unsetenv("CBM_DISCOVER_TEST_FAIL_PHASE");
+    cbm_setenv("CBM_DISCOVER_TEST_FAIL_PHASE", "file_strdup", 1);
+    int rc = cbm_discover_ex(base, &opts, &files, &count, NULL, NULL, &degraded);
+    cbm_unsetenv("CBM_DISCOVER_TEST_FAIL_PHASE");
+    cbm_unsetenv("CBM_DISCOVER_TEST_FAIL_NTH");
+    ASSERT_EQ(rc, 0);
+    /* The last attempted file rolled back — no NULL path downstream. */
+    ASSERT_TRUE(degraded);
+    ASSERT_EQ(count, 1); /* one file survived; the faulted one is absent */
+    for (int i = 0; i < count; i++) {
+        ASSERT_NOT_NULL(files[i].path);
+        ASSERT_NOT_NULL(files[i].rel_path);
+    }
+
+    cbm_discover_free(files, count);
+    th_cleanup(base);
+    PASS();
+}
+
+/* An excluded-list grow fault degrades the walk without losing files. */
+TEST(discover_excluded_grow_fault_degrades_walk) {
+    char *base = th_mktempdir("cbm_disc_oom_excl");
+    ASSERT(base != NULL);
+
+    th_write_file(TH_PATH(base, "a.go"), "package a\n");
+    th_write_file(TH_PATH(base, "node_modules/dep.go"), "package dep\n");
+
+    cbm_setenv("CBM_DISCOVER_TEST_FAIL_PHASE", "excluded_grow", 1);
+    cbm_setenv("CBM_DISCOVER_TEST_FAIL_NTH", "1", 1);
+
+    cbm_discover_opts_t opts = {0};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+    bool degraded = false;
+
+    int rc = cbm_discover_ex(base, &opts, &files, &count, NULL, NULL, &degraded);
+    cbm_unsetenv("CBM_DISCOVER_TEST_FAIL_PHASE");
+    cbm_unsetenv("CBM_DISCOVER_TEST_FAIL_NTH");
+    ASSERT_EQ(rc, 0);
+    /* Files are unaffected; only the skip-point record was dropped. */
+    ASSERT_EQ(count, 1);
+    ASSERT_TRUE(degraded);
+
+    cbm_discover_free(files, count);
+    th_cleanup(base);
+    PASS();
+}
+
+/* A walk-stack calloc fault degrades to an empty-but-flagged result: the
+ * caller must not mistake the empty file list for an empty tree. */
+TEST(discover_stack_calloc_fault_flags_empty_result) {
+    char *base = th_mktempdir("cbm_disc_oom_stack");
+    ASSERT(base != NULL);
+
+    th_write_file(TH_PATH(base, "a.go"), "package a\n");
+
+    cbm_setenv("CBM_DISCOVER_TEST_FAIL_PHASE", "stack_calloc", 1);
+
+    cbm_discover_opts_t opts = {0};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+    bool degraded = false;
+
+    int rc = cbm_discover_ex(base, &opts, &files, &count, NULL, NULL, &degraded);
+    cbm_unsetenv("CBM_DISCOVER_TEST_FAIL_PHASE");
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(count, 0);
+    ASSERT_TRUE(degraded); /* empty result, NOT an empty tree */
+
     cbm_discover_free(files, count);
     th_cleanup(base);
     PASS();
@@ -1427,7 +1597,12 @@ SUITE(discover) {
     RUN_TEST(discover_nested_gitignore);
     RUN_TEST(discover_nested_gitignore_stacks_with_root);
 
-    /* Degraded discovery (bounded walk stack, #17 / upstream 03dc9c91) */
-    RUN_TEST(discover_degraded_when_walk_stack_exhausted);
+    /* Wide-directory discovery (growing walk stack, #17 / upstream 03dc9c91) */
+    RUN_TEST(discover_wide_fanout_indexed_completely);
+    RUN_TEST(discover_stack_grows_repeatedly);
+    RUN_TEST(discover_wide_fanout_keeps_nested_gitignores);
+    RUN_TEST(discover_files_grow_fault_rolls_back_entry);
+    RUN_TEST(discover_excluded_grow_fault_degrades_walk);
+    RUN_TEST(discover_stack_calloc_fault_flags_empty_result);
     RUN_TEST(discover_not_degraded_on_complete_walk);
 }

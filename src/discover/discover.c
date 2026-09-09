@@ -417,6 +417,7 @@ typedef struct {
     char **excluded;
     int excluded_count;
     int excluded_cap;
+    char cache_tree[CBM_SZ_4K];
     /* Set when the walk could not fully materialize (e.g. a walk-stack grow
      * failed on allocation). Callers keep whatever was discovered; the flag
      * distinguishes a complete walk from a partially-degraded one (upstream
@@ -556,8 +557,7 @@ static bool is_safety_core_dir(const char *name) {
  * the shared CBM cache/database as repository input"): refusing any root that
  * contains the cache was considered and rejected as too blunt — not walking
  * the cache is what the boundary actually asks for. (Upstream 7814dacf.) */
-static bool dir_is_cache_tree(const char *abs_path) {
-    const char *cache = cbm_resolve_cache_dir();
+static bool dir_is_cache_tree(const char *abs_path, const char *cache) {
     if (!cache || !cache[0] || !abs_path || !abs_path[0]) {
         return false;
     }
@@ -825,7 +825,7 @@ static void walk_dir_process_entry(cbm_dirent_t *entry, const walk_frame_t *fram
     }
 
     if (S_ISDIR(st.st_mode)) {
-        if (!dir_is_cache_tree(abs_path) &&
+        if (!dir_is_cache_tree(abs_path, out->cache_tree) &&
             !should_skip_directory(entry->name, rel_path, opts, gitignore, global_gi, cbmignore,
                                    frame->local_gi, frame->local_gi_prefix)) {
             walk_push_subdir(ws, abs_path, rel_path, frame, out);
@@ -1101,6 +1101,18 @@ int cbm_discover_ex(const char *repo_path, const cbm_discover_opts_t *opts, cbm_
 
     /* Walk */
     file_list_t fl = {0};
+    const char *cache = cbm_resolve_cache_dir();
+    if (cache && cache[0]) {
+#ifdef _WIN32
+        if (!_fullpath(fl.cache_tree, cache, sizeof(fl.cache_tree))) {
+            snprintf(fl.cache_tree, sizeof(fl.cache_tree), "%s", cache);
+        }
+#else
+        if (!realpath(cache, fl.cache_tree)) {
+            snprintf(fl.cache_tree, sizeof(fl.cache_tree), "%s", cache);
+        }
+#endif
+    }
     walk_dir(repo_path, "", opts, gitignore, global_gi, cbmignore, &fl);
 
     /* Cleanup */

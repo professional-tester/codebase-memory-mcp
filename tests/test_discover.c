@@ -977,6 +977,43 @@ TEST(discover_cache_prune_is_boundary_aware) {
     PASS();
 }
 
+/* The configured cache path may contain aliases such as "..". Compare
+ * canonical paths so the same directory is still pruned. */
+TEST(discover_prunes_canonical_cache_alias) {
+    char *base = th_mktempdir("cbm_disc_cache_alias");
+    ASSERT(base != NULL);
+
+    th_write_file(TH_PATH(base, "src/main.go"), "package main\n");
+    th_write_file(TH_PATH(base, "cache/other_workspace/leaked.go"), "package leaked\n");
+    ASSERT(th_mkdir_p(TH_PATH(base, "alias_anchor")) == 0);
+
+    const char *saved = getenv("CBM_CACHE_DIR");
+    char *saved_copy = saved ? strdup(saved) : NULL;
+    char cache_alias[1024];
+    snprintf(cache_alias, sizeof(cache_alias), "%s/alias_anchor/../cache", base);
+    cbm_setenv("CBM_CACHE_DIR", cache_alias, 1);
+
+    cbm_discover_opts_t opts = {0};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+    int rc = cbm_discover(base, &opts, &files, &count);
+
+    if (saved_copy) {
+        cbm_setenv("CBM_CACHE_DIR", saved_copy, 1);
+        free(saved_copy);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+
+    ASSERT_EQ(rc, 0);
+    ASSERT_FALSE(discover_has_rel_path(files, count, "cache/other_workspace/leaked.go"));
+    ASSERT_TRUE(discover_has_rel_path(files, count, "src/main.go"));
+
+    cbm_discover_free(files, count);
+    th_cleanup(base);
+    PASS();
+}
+
 /* A walk-stack calloc fault degrades to an empty-but-flagged result: the
  * caller must not mistake the empty file list for an empty tree. */
 TEST(discover_stack_calloc_fault_flags_empty_result) {
@@ -1709,6 +1746,7 @@ SUITE(discover) {
     /* Cache-tree pruning (#17 boundary / upstream 7814dacf) */
     RUN_TEST(discover_prunes_the_cache_tree);
     RUN_TEST(discover_cache_prune_is_boundary_aware);
+    RUN_TEST(discover_prunes_canonical_cache_alias);
 
     /* Wide-directory discovery (growing walk stack, #17 / upstream 03dc9c91) */
     RUN_TEST(discover_wide_fanout_indexed_completely);

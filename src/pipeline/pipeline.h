@@ -84,6 +84,12 @@ int cbm_pipeline_get_mode(const cbm_pipeline_t *p);
  * to NULL/0 when p is NULL or nothing was excluded. Do not free. */
 void cbm_pipeline_get_excluded(const cbm_pipeline_t *p, char ***out, int *count);
 
+/* True when discovery could not fully materialize the tree (bounded walk stack
+ * full / allocation failure). The index produced from such a run covers only
+ * the files that were actually discovered (#17, upstream 03dc9c91); callers
+ * should surface a degraded status. false when p is NULL. */
+bool cbm_pipeline_discover_degraded(const cbm_pipeline_t *p);
+
 /* Committed node/edge counts captured at dump time (-1 when dump did not run).
  * Nodes are the #334 plausibility-gate axis; edges are informational only. */
 void cbm_pipeline_get_committed_counts(const cbm_pipeline_t *p, int *nodes, int *edges);

@@ -126,9 +126,15 @@ int cbm_discover(const char *repo_path, const cbm_discover_opts_t *opts, cbm_fil
  * owns it and must free via cbm_discover_free_excluded(). Pass NULL for
  * excluded_out (and/or excluded_count_out) to discard the list — the internal
  * accumulator is freed in that case (no leak).
+ * degraded_out (optional, may be NULL) receives true when the walk could not
+ * fully materialize (bounded walk stack full, allocation failure): whatever
+ * was discovered is returned but the result is NOT a complete view of the
+ * tree (#17, upstream 03dc9c91). Callers should surface a degraded/partial
+ * status instead of treating the output as authoritative.
  * Returns 0 on success, -1 on error. */
 int cbm_discover_ex(const char *repo_path, const cbm_discover_opts_t *opts, cbm_file_info_t **out,
-                    int *count, char ***excluded_out, int *excluded_count_out);
+                    int *count, char ***excluded_out, int *excluded_count_out,
+                    bool *degraded_out);
 
 /* Free an array of file info results. NULL-safe. */
 void cbm_discover_free(cbm_file_info_t *files, int count);

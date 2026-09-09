@@ -46,6 +46,15 @@ static bool discover_has_rel_path(const cbm_file_info_t *files, int count, const
     return false;
 }
 
+static bool discover_excluded_contains(char **excluded, int count, const char *rel_path) {
+    for (int i = 0; i < count; i++) {
+        if (strcmp(excluded[i], rel_path) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /* ── Directory skip (always skipped) ───────────────────────────── */
 
 TEST(skip_git) {
@@ -668,6 +677,76 @@ TEST(discover_skips_worktrees) {
     PASS();
 }
 
+/* ── Degraded discovery (bounded walk stack, #17 / upstream 03dc9c91) ── */
+
+/* A directory with more subdirectories than the bounded walk stack can hold
+ * (WALK_STACK_CAP = 512) must be flagged degraded: subdirs queued past the
+ * bound are not walked, each dropped subtree is reported as excluded, and the
+ * caller knows the result is NOT a complete view of the tree. readdir order is
+ * filesystem-dependent, so only aggregate counts are asserted. */
+TEST(discover_degraded_when_walk_stack_exhausted) {
+    char *base = th_mktempdir("cbm_disc_degraded_stack");
+    ASSERT(base != NULL);
+
+    /* 600 subdirs, one file each: 512 stack frames cannot hold them all. */
+    enum { SUBDIRS = 600, STACK_CAP = 512 };
+    char dir[4096];
+    char file[4200];
+    for (int i = 0; i < SUBDIRS; i++) {
+        snprintf(dir, sizeof(dir), "%s/d%03d", base, i);
+        ASSERT(th_mkdir_p(dir) == 0);
+        snprintf(file, sizeof(file), "%s/f.go", dir);
+        ASSERT(th_write_file(file, "package d\n") == 0);
+    }
+
+    cbm_discover_opts_t opts = {0};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+    char **excluded = NULL;
+    int excluded_count = 0;
+    bool degraded = false;
+
+    int rc = cbm_discover_ex(base, &opts, &files, &count, &excluded, &excluded_count, &degraded);
+    ASSERT_EQ(rc, 0);
+    /* The walk itself succeeds — it just did not see everything. */
+    ASSERT_TRUE(degraded);
+    /* Every subdir is either discovered (one file) or reported excluded. */
+    ASSERT_EQ(count, STACK_CAP);
+    ASSERT_EQ(excluded_count, SUBDIRS - STACK_CAP);
+    /* No double-counting: discovered files all come from walked subdirs. */
+    for (int i = 0; i < count; i++) {
+        ASSERT_TRUE(strstr(files[i].rel_path, "/f.go") != NULL);
+    }
+
+    cbm_discover_free_excluded(excluded, excluded_count);
+    cbm_discover_free(files, count);
+    th_cleanup(base);
+    PASS();
+}
+
+/* A normal shallow tree is NOT degraded, and a NULL degraded_out stays legal. */
+TEST(discover_not_degraded_on_complete_walk) {
+    char *base = th_mktempdir("cbm_disc_degraded_ok");
+    ASSERT(base != NULL);
+
+    th_write_file(TH_PATH(base, "a.go"), "package a\n");
+    th_write_file(TH_PATH(base, "sub/b.go"), "package b\n");
+
+    cbm_discover_opts_t opts = {0};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+    bool degraded = true;
+
+    int rc = cbm_discover_ex(base, &opts, &files, &count, NULL, NULL, &degraded);
+    ASSERT_EQ(rc, 0);
+    ASSERT_FALSE(degraded);
+    ASSERT_EQ(count, 2);
+
+    cbm_discover_free(files, count);
+    th_cleanup(base);
+    PASS();
+}
+
 TEST(discover_cbmignore) {
     char *base = th_mktempdir("cbm_disc_cbmi");
     ASSERT(base != NULL);
@@ -874,15 +953,6 @@ TEST(discover_cbmignore_no_git) {
 
 /* ── .cbmignore negation vs built-in skip dirs (issue #500) ────── */
 
-static bool discover_excluded_contains(char **excluded, int count, const char *rel_path) {
-    for (int i = 0; i < count; i++) {
-        if (strcmp(excluded[i], rel_path) == 0) {
-            return true;
-        }
-    }
-    return false;
-}
-
 /* A "!obj/" negation in .cbmignore must un-skip the built-in ALWAYS_SKIP
  * "obj" dir so files inside it get discovered — and the un-skipped dir must
  * not be reported as an excluded subtree (#411 list stays coherent). */
@@ -900,7 +970,7 @@ TEST(discover_cbmignore_negates_always_skip_dir) {
     char **excluded = NULL;
     int excluded_count = 0;
 
-    int rc = cbm_discover_ex(base, &opts, &files, &count, &excluded, &excluded_count);
+    int rc = cbm_discover_ex(base, &opts, &files, &count, &excluded, &excluded_count, NULL);
     ASSERT_EQ(rc, 0);
     ASSERT_EQ(count, 2);
     ASSERT_TRUE(discover_has_rel_path(files, count, "main.go"));
@@ -1356,4 +1426,8 @@ SUITE(discover) {
     /* Nested .gitignore tests (issue #178) */
     RUN_TEST(discover_nested_gitignore);
     RUN_TEST(discover_nested_gitignore_stacks_with_root);
+
+    /* Degraded discovery (bounded walk stack, #17 / upstream 03dc9c91) */
+    RUN_TEST(discover_degraded_when_walk_stack_exhausted);
+    RUN_TEST(discover_not_degraded_on_complete_walk);
 }

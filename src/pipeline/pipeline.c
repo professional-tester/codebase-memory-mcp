@@ -95,6 +95,11 @@ struct cbm_pipeline {
     char **excluded_dirs;
     int excluded_count;
 
+    /* Set when discovery could not fully materialize the tree (bounded walk
+     * stack full / allocation failure). The MCP layer reports a degraded index
+     * instead of a complete-looking partial one (#17, upstream 03dc9c91). */
+    bool discover_degraded;
+
     /* Per-file indexing failures (skipped files) surfaced via MCP/CLI/logfile
      * (Stage 2 / Track B). A skip is the expected handled outcome of a bad or
      * oversized file — the run still succeeds ("indexed"). Owned by the
@@ -278,6 +283,10 @@ void cbm_pipeline_get_excluded(const cbm_pipeline_t *p, char ***out, int *count)
     if (count) {
         *count = p ? p->excluded_count : 0;
     }
+}
+
+bool cbm_pipeline_discover_degraded(const cbm_pipeline_t *p) {
+    return p ? p->discover_degraded : false;
 }
 
 /* NULL-safe heap strdup (avoids a strdup dependency + guards NULL inputs). */
@@ -1572,8 +1581,13 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
     cbm_discover_free_excluded(p->excluded_dirs, p->excluded_count);
     p->excluded_dirs = NULL;
     p->excluded_count = 0;
+    bool discover_degraded = false;
     int rc = cbm_discover_ex(p->repo_path, &opts, &files, &file_count, &p->excluded_dirs,
-                             &p->excluded_count);
+                             &p->excluded_count, &discover_degraded);
+    p->discover_degraded = discover_degraded;
+    if (discover_degraded) {
+        cbm_log_warn("pipeline.discover", "degraded", "true");
+    }
     if (rc != 0) {
         cbm_log_error("pipeline.err", "phase", "discover", "rc", itoa_buf(rc));
     }

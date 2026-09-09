@@ -417,6 +417,11 @@ typedef struct {
     char **excluded;
     int excluded_count;
     int excluded_cap;
+    /* Set when the walk could not fully materialize (e.g. a walk-stack grow
+     * failed on allocation). Callers keep whatever was discovered; the flag
+     * distinguishes a complete walk from a partially-degraded one (upstream
+     * 03dc9c91, #17). */
+    bool failed;
 } file_list_t;
 
 static void file_list_add_excluded(file_list_t *fl, const char *rel_path) {
@@ -427,6 +432,8 @@ static void file_list_add_excluded(file_list_t *fl, const char *rel_path) {
         int new_cap = fl->excluded_cap ? fl->excluded_cap * PAIR_LEN : CBM_SZ_64;
         char **grown = realloc(fl->excluded, new_cap * sizeof(char *));
         if (!grown) {
+            /* Dropped skip-point record — the walk is no longer complete (#17). */
+            fl->failed = true;
             return;
         }
         fl->excluded = grown;
@@ -434,6 +441,7 @@ static void file_list_add_excluded(file_list_t *fl, const char *rel_path) {
     }
     char *copy = strdup(rel_path);
     if (!copy) {
+        fl->failed = true;
         return;
     }
     fl->excluded[fl->excluded_count++] = copy;
@@ -445,6 +453,10 @@ static void fl_add(file_list_t *fl, const char *abs_path, const char *rel_path, 
         int new_cap = fl->capacity ? fl->capacity * PAIR_LEN : CBM_SZ_256;
         cbm_file_info_t *new_files = realloc(fl->files, new_cap * sizeof(cbm_file_info_t));
         if (!new_files) {
+            /* Checked bounds growth (#17): on allocation failure the file is
+             * dropped and the walk is flagged incomplete instead of silently
+             * indexing a partial view as if it were the whole tree. */
+            fl->failed = true;
             return;
         }
         fl->files = new_files;
@@ -456,6 +468,11 @@ static void fl_add(file_list_t *fl, const char *abs_path, const char *rel_path, 
     fi->rel_path = strdup(rel_path);
     fi->language = lang;
     fi->size = size;
+    if (!fi->path || !fi->rel_path) {
+        /* Keep the entry (count already advanced) but flag the walk: a NULL
+         * path must never be treated as a complete discovery result. */
+        fl->failed = true;
+    }
 }
 
 /* ── Recursive walk ─────────────────────────────── */
@@ -671,17 +688,20 @@ static cbm_gitignore_t *try_load_nested_gitignore(const walk_frame_t *frame) {
     return NULL;
 }
 
-/* Push a subdirectory onto the walk stack, inheriting local gitignore context. */
-static void walk_push_subdir(walk_frame_t *stack, int *top, const char *abs_path,
+/* Push a subdirectory onto the walk stack, inheriting local gitignore context.
+ * Returns false when the bounded stack is full — the subtree is NOT walked and
+ * the caller must flag the discovery as incomplete (#17, upstream 03dc9c91). */
+static bool walk_push_subdir(walk_frame_t *stack, int *top, const char *abs_path,
                              const char *rel_path, const walk_frame_t *parent) {
     if (*top >= WALK_STACK_CAP) {
-        return;
+        return false;
     }
     snprintf(stack[*top].dir, CBM_SZ_4K, "%s", abs_path);
     snprintf(stack[*top].prefix, CBM_SZ_4K, "%s", rel_path);
     stack[*top].local_gi = parent->local_gi;
     snprintf(stack[*top].local_gi_prefix, CBM_SZ_4K, "%s", parent->local_gi_prefix);
     (*top)++;
+    return true;
 }
 
 static void walk_dir_process_entry(cbm_dirent_t *entry, const walk_frame_t *frame,
@@ -707,7 +727,14 @@ static void walk_dir_process_entry(cbm_dirent_t *entry, const walk_frame_t *fram
     if (S_ISDIR(st.st_mode)) {
         if (!should_skip_directory(entry->name, rel_path, opts, gitignore, global_gi, cbmignore,
                                    frame->local_gi, frame->local_gi_prefix)) {
-            walk_push_subdir(stack, top, abs_path, rel_path, frame);
+            if (!walk_push_subdir(stack, top, abs_path, rel_path, frame)) {
+                /* Bounded walk stack full: this subtree is silently dropped.
+                 * Record the skip point and flag the walk as incomplete so the
+                 * caller surfaces a degraded result instead of a partial index
+                 * that looks complete (#17, upstream 03dc9c91). */
+                file_list_add_excluded(out, rel_path);
+                out->failed = true;
+            }
         } else {
             /* Record the excluded subtree root so callers can report it (#411). */
             file_list_add_excluded(out, rel_path);
@@ -725,6 +752,9 @@ static void walk_dir(const char *dir_path, const char *rel_prefix, const cbm_dis
                      const cbm_gitignore_t *cbmignore, file_list_t *out) {
     walk_frame_t *stack = calloc(WALK_STACK_CAP, sizeof(walk_frame_t));
     if (!stack) {
+        /* Nothing was walked at all — flag so the caller does not mistake an
+         * empty result for an empty tree (#17). */
+        out->failed = true;
         return;
     }
     /* Collect all owned gitignores — freed at the end because child frames
@@ -746,6 +776,14 @@ static void walk_dir(const char *dir_path, const char *rel_prefix, const cbm_dis
             snprintf(frame.local_gi_prefix, sizeof(frame.local_gi_prefix), "%s", frame.prefix);
             if (owned_count < GI_OWNED_CAP) {
                 owned_gis[owned_count++] = loaded;
+            } else {
+                /* Loaded nested gitignore cannot be tracked for ownership; it is
+                 * freed below only while still borrowed by queued frames — so
+                 * treat this as an incomplete walk rather than risk a leak/UAF
+                 * by continuing past the tracked-ownership bound (#17). */
+                cbm_gitignore_free(loaded);
+                frame.local_gi = NULL;
+                out->failed = true;
             }
         }
 
@@ -873,16 +911,20 @@ static bool resolve_git_common_dir(const char *repo_path, char *common_dir, size
 
 int cbm_discover(const char *repo_path, const cbm_discover_opts_t *opts, cbm_file_info_t **out,
                  int *count) {
-    return cbm_discover_ex(repo_path, opts, out, count, NULL, NULL);
+    return cbm_discover_ex(repo_path, opts, out, count, NULL, NULL, NULL);
 }
 
 int cbm_discover_ex(const char *repo_path, const cbm_discover_opts_t *opts, cbm_file_info_t **out,
-                    int *count, char ***excluded_out, int *excluded_count_out) {
+                    int *count, char ***excluded_out, int *excluded_count_out,
+                    bool *degraded_out) {
     if (excluded_out) {
         *excluded_out = NULL;
     }
     if (excluded_count_out) {
         *excluded_count_out = 0;
+    }
+    if (degraded_out) {
+        *degraded_out = false;
     }
     if (!repo_path || !out || !count) {
         return CBM_NOT_FOUND;
@@ -965,6 +1007,9 @@ int cbm_discover_ex(const char *repo_path, const cbm_discover_opts_t *opts, cbm_
 
     *out = fl.files;
     *count = fl.count;
+    if (degraded_out) {
+        *degraded_out = fl.failed;
+    }
 
     /* Hand the excluded-dir list to the caller, or free it if not requested. */
     if (excluded_out) {

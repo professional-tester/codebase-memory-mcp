@@ -4341,6 +4341,12 @@ static bool build_index_success_response(cbm_mcp_server_t *srv, yyjson_mut_doc *
     add_excluded_summary(doc, root, excluded_dirs, excluded_count);
     add_skipped_summary(doc, root, file_errors, file_error_count, logfile);
 
+    /* Discovery could not fully materialize the tree (bounded walk stack full
+     * / allocation failure): the index covers only the files actually found,
+     * so the run must not report a complete-looking "indexed" status (#17,
+     * upstream 03dc9c91). */
+    bool degraded = cbm_pipeline_discover_degraded(p);
+
     int exp_nodes = -1;
     int exp_edges = -1;
     cbm_pipeline_get_committed_counts(p, &exp_nodes, &exp_edges);
@@ -4351,7 +4357,6 @@ static bool build_index_success_response(cbm_mcp_server_t *srv, yyjson_mut_doc *
     cbm_store_t *store = NULL;
     int nodes = 0;
     int edges = 0;
-    bool degraded = false;
     bool zova_authority = false;
 
 #if CBM_WITH_ZOVA
@@ -4408,7 +4413,14 @@ static bool build_index_success_response(cbm_mcp_server_t *srv, yyjson_mut_doc *
     }
 
     if (degraded) {
-        if (zova_authority) {
+        if (cbm_pipeline_discover_degraded(p)) {
+            yyjson_mut_obj_add_str(
+                doc, root, "hint",
+                "File discovery was incomplete (bounded walk budget or allocation "
+                "failure) — the index covers only the files that were found. "
+                "Re-run index_repository(repo_path=...) to rebuild.");
+            cbm_log_warn("dump.verify", "reason", "discover_degraded");
+        } else if (zova_authority) {
             yyjson_mut_obj_add_str(
                 doc, root, "hint",
                 "Committed shared Zova workspace failed verification. "

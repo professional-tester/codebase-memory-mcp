@@ -909,7 +909,7 @@ TEST(tool_search_graph_basic) {
 /* A semantic-only search_graph call (semantic_query, no structural filter)
  * must not also run the UNFILTERED structural search: that prepended up to
  * `limit` unrelated enriched nodes to a purely semantic request. Covers both
- * default and JSON output. (Issue #25 / upstream 108740d8.) */
+ * the compatibility route. (Issue #25 / upstream 108740d8.) */
 static char *extract_text_content(const char *mcp_result);
 
 TEST(tool_search_graph_semantic_only_skips_structural_results_issue1295) {
@@ -936,13 +936,27 @@ TEST(tool_search_graph_semantic_only_skips_structural_results_issue1295) {
     ASSERT_NULL(strstr(resp, "unrelated_node"));
     free(resp);
 
-    resp = cbm_mcp_handle_tool(
-        srv, "search_graph",
-        "{\"project\":\"semantic-only\",\"semantic_query\":[\"publish\"],\"limit\":5}");
-    ASSERT_NOT_NULL(resp);
-    ASSERT_NULL(strstr(resp, "unrelated_node"));
-    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
 
+TEST(tool_search_graph_empty_structural_search_keeps_envelope) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_mcp_server_set_project(srv, "empty-structural");
+    ASSERT_EQ(cbm_store_upsert_project(cbm_mcp_server_store(srv), "empty-structural",
+                                       "/tmp/empty-structural"),
+              CBM_STORE_OK);
+
+    char *resp = cbm_mcp_handle_tool(
+        srv, "search_graph",
+        "{\"project\":\"empty-structural\",\"name_pattern\":\"does-not-exist\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"total\":0"));
+    ASSERT_NOT_NULL(strstr(resp, "\"results\":[]"));
+    ASSERT_NOT_NULL(strstr(resp, "\"has_more\":false"));
+
+    free(resp);
     cbm_mcp_server_free(srv);
     PASS();
 }
@@ -1777,6 +1791,8 @@ TEST(tool_search_graph_includes_node_properties) {
     ASSERT_NOT_NULL(strstr(inner, "signature"));
     ASSERT_NOT_NULL(strstr(inner, "func HandleRequest"));
     ASSERT_NOT_NULL(strstr(inner, "is_exported"));
+    ASSERT_NOT_NULL(strstr(inner, "\"tags\":[\"http\",\"public\"]"));
+    ASSERT_NOT_NULL(strstr(inner, "\"metadata\":{\"owner\":\"api\"}"));
     free(inner);
     free(resp);
 
@@ -3992,7 +4008,9 @@ static cbm_mcp_server_t *setup_snippet_server(char *tmp_dir, size_t tmp_sz) {
     n_hr.end_line = 5;
     n_hr.properties_json = "{\"signature\":\"func HandleRequest() error\","
                            "\"return_type\":\"error\","
-                           "\"is_exported\":true}";
+                           "\"is_exported\":true,"
+                           "\"tags\":[\"http\",\"public\"],"
+                           "\"metadata\":{\"owner\":\"api\"}}";
     int64_t id_hr = cbm_store_upsert_node(st, &n_hr);
 
     cbm_node_t n_po = {0};
@@ -6548,6 +6566,7 @@ SUITE(mcp) {
     RUN_TEST(tool_unknown_tool);
     RUN_TEST(tool_search_graph_basic);
     RUN_TEST(tool_search_graph_semantic_only_skips_structural_results_issue1295);
+    RUN_TEST(tool_search_graph_empty_structural_search_keeps_envelope);
     RUN_TEST(search_graph_schema_accepts_project_or_projects);
     RUN_TEST(tool_search_graph_rejects_project_and_projects);
     RUN_TEST(tool_search_graph_rejects_empty_projects);

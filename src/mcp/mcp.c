@@ -2033,14 +2033,7 @@ static void emit_search_results(yyjson_mut_doc *doc, yyjson_mut_val *root,
                                 yyjson_doc ***out_pdocs, int *out_pdoc_count) {
     yyjson_doc **pdocs = out->count > 0 ? malloc((size_t)out->count * sizeof(yyjson_doc *)) : NULL;
     int pdoc_count = 0;
-    /* A semantic-only call skips the structural search, so it also skips the
-     * structural envelope (total/results/has_more) — the flagged and catalog
-     * routes emit semantic_results alone, and a mismatched envelope here made
-     * the same request shape differ per storage route. (Issue #25.) */
-    bool structural_ran = out->total > 0 || out->count > 0;
-    if (structural_ran) {
-        yyjson_mut_obj_add_int(doc, root, "total", out->total);
-    }
+    yyjson_mut_obj_add_int(doc, root, "total", out->total);
     yyjson_mut_val *results = yyjson_mut_arr(doc);
     for (int i = 0; i < out->count; i++) {
         cbm_search_result_t *sr = &out->results[i];
@@ -2062,16 +2055,24 @@ static void emit_search_results(yyjson_mut_doc *doc, yyjson_mut_val *root,
         }
         yyjson_mut_arr_add_val(results, item);
     }
-    if (structural_ran) {
-        yyjson_mut_obj_add_val(doc, root, "results", results);
-        yyjson_mut_obj_add_bool(doc, root, "has_more", out->total > offset + out->count);
-    }
+    yyjson_mut_obj_add_val(doc, root, "results", results);
+    yyjson_mut_obj_add_bool(doc, root, "has_more", out->total > offset + out->count);
     *out_pdocs = pdocs;
     *out_pdoc_count = pdoc_count;
 }
 
 static bool run_semantic_query(yyjson_mut_doc *doc, yyjson_mut_val *root, const char *args,
                                cbm_store_t *store, const char *project, int limit);
+
+static bool search_args_has_semantic_query(const char *args) {
+    yyjson_doc *args_doc = yyjson_read(args, strlen(args), 0);
+    yyjson_val *args_root = args_doc ? yyjson_doc_get_root(args_doc) : NULL;
+    bool present = args_root && yyjson_obj_get(args_root, "semantic_query");
+    if (args_doc) {
+        yyjson_doc_free(args_doc);
+    }
+    return present;
+}
 
 static void emit_flagged_fts_results(yyjson_mut_doc *doc, yyjson_mut_val *root,
                                      const cbm_search_output_t *out, int offset) {
@@ -2136,7 +2137,8 @@ static char *handle_search_graph_flagged(const char *args, char *project) {
      * filter, running the UNFILTERED regex search would prepend unrelated
      * enriched nodes to a purely semantic request — same gate as the
      * compatibility route. (Upstream 108740d8.) */
-    bool has_structural_filters = name_pattern || qn_pattern || label || file_pattern ||
+    bool has_structural_filters = !search_args_has_semantic_query(args) || name_pattern ||
+                                  qn_pattern || label || file_pattern ||
                                   relationship ||
                                   params.min_degree != CBM_NOT_FOUND ||
                                   params.max_degree != CBM_NOT_FOUND;
@@ -2538,7 +2540,8 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
      * must not also run the UNFILTERED regex search: that prepended up to
      * `limit` unrelated enriched nodes to a purely semantic request. The
      * flagged (full-authority) path has the same gate. (Upstream 108740d8.) */
-    bool has_structural_filters = label || name_pattern || qn_pattern || file_pattern ||
+    bool has_structural_filters = !search_args_has_semantic_query(args) || label || name_pattern ||
+                                  qn_pattern || file_pattern ||
                                   relationship || exclude_entry_points ||
                                   min_degree != CBM_NOT_FOUND || max_degree != CBM_NOT_FOUND;
 
@@ -2578,8 +2581,10 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
 
     yyjson_doc **props_docs = NULL;
     int props_doc_count = 0;
-    emit_search_results(doc, root, &out, store, relationship, include_connected, offset,
-                        &props_docs, &props_doc_count);
+    if (has_structural_filters) {
+        emit_search_results(doc, root, &out, store, relationship, include_connected, offset,
+                            &props_docs, &props_doc_count);
+    }
 
     /* Add diagnostic hint when zero results — only meaningful when the
      * structural search actually ran (a semantic-only request legitimately
@@ -5175,6 +5180,11 @@ static yyjson_doc *enrich_node_properties(yyjson_mut_doc *doc, yyjson_mut_val *o
             yyjson_mut_obj_add_int(doc, obj, k, yyjson_get_int(val));
         } else if (yyjson_is_real(val)) {
             yyjson_mut_obj_add_real(doc, obj, k, yyjson_get_real(val));
+        } else if (yyjson_is_arr(val) || yyjson_is_obj(val)) {
+            yyjson_mut_val *copy = yyjson_val_mut_copy(doc, val);
+            if (copy) {
+                yyjson_mut_obj_add_val(doc, obj, k, copy);
+            }
         }
     }
     return props_doc; /* caller frees after serialization */

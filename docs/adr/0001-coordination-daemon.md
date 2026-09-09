@@ -9,8 +9,9 @@
 
 ## Decision
 
-**Add an exclusive per-workspace lease around the entire indexing pipeline. Retain the
-database-wide writer gate for every actual Zova mutation and every whole-file operation.**
+**Add an exclusive per-workspace lease around the entire indexing pipeline and a shared/exclusive
+preparation barrier around pipelines and whole-file replacement. Retain the database-wide writer
+gate for every actual Zova mutation and every whole-file operation.**
 
 1. **Per-workspace indexing lease — new.** One exclusive lease per `workspace_id`, held for the
    whole index run: extraction, LSP and semantic passes, CBM prepared-view construction,
@@ -20,13 +21,17 @@ database-wide writer gate for every actual Zova mutation and every whole-file op
    (publish, delta, delete-workspace, quarantine, migration) and every whole-file operation
    (compact, restore, import, repack). It is **not** narrowed, relaxed, or replaced. The lease
    governs *work*; the gate governs *database mutation*. They are layered, not alternatives.
-3. **Concurrency target.** Different workspaces prepare concurrently and serialize only at
+3. **Database preparation barrier — new.** Pipelines hold it shared for their entire lifetime.
+   Whole-file operations (`restore`, `import`, and `repack`) hold it exclusive through file
+   replacement. This prevents an in-flight pipeline from publishing stale prepared state into a
+   newly restored database.
+4. **Concurrency target.** Different workspaces prepare concurrently and serialize only at
    publication. A second request for a workspace already being indexed does not start a
    duplicate run — it waits or fails fast instead of running a pipeline whose result will be
    superseded.
-4. **Deferred.** Build-cohort admission and shared watcher/UI ownership are out of scope until
+5. **Deferred.** Build-cohort admission and shared watcher/UI ownership are out of scope until
    their compatibility and liveness contracts are separately designed.
-5. **Daemon process — rejected** for now, per the analysis below. Revisit only if the gates in
+6. **Daemon process — rejected** for now, per the analysis below. Revisit only if the gates in
    [Revisit triggers](#revisit-triggers) are met.
 
 ### Why the daemon itself is rejected
@@ -160,10 +165,9 @@ build, or ABI differs, and requires all active processes to match. That is corre
 upstream's daemon-owned-services model, but for this fork it would turn a partial update into a
 hard refusal for work that is demonstrably safe.
 
-**Conclusion:** adopt identity *detection and explicit refusal for writers*, not exact-build
-admission for all participants. Record binary fingerprint, protocol/store/feature ABI,
-cache-root fingerprint, and pinned-Zova commit in a lock file; map upstream's
-`cbm_daemon_hello_status_t` failure modes (`service.h:38-47`) onto fork-specific refusals.
+**Conclusion:** defer build-cohort identity and exact-build admission. The existing on-open
+format/schema compatibility gate remains authoritative until a separate design establishes that
+cross-build exclusion is necessary and defines its upgrade behavior.
 
 ### 4. Concurrent MCP, CLI, watcher, UI, backup, restore, and compaction
 
@@ -314,9 +318,10 @@ genuinely protects (`srv->active_pipeline`). Every call site needs its workspace
 
 ### Ordering
 
-Only one lock is held at a time in this design — the lease for the whole run, the gate only
-inside publish — so no lock-ordering cycle is introduced. Constraint to enforce in review:
-**never acquire the workspace lease while holding the writer gate.** The existing
+Locks are nested during publication, so every path must use one order:
+**preparation barrier → workspace lease → writer gate**. Pipelines acquire the shared barrier
+before the workspace lease and acquire the gate only during publication. Whole-file operations
+acquire the exclusive barrier before the gate and never acquire a workspace lease. The existing
 release/reacquire hazard at `cbm_zova_operations.c:2333-2336` lives entirely inside the
 operations module, takes no workspace lease, and stays untouched.
 
@@ -327,22 +332,12 @@ The gate covers whole-file operations, but a pipeline for workspace `W` may now 
 prevents this with an `EX(project-set)` wildcard that blocks every named project
 (`project_lock.h:18-20`).
 
-**Interim contract (this decision).** A workspace lease does not exclude whole-file replacement.
-The window is acknowledged and bounded as follows:
-
-- A publish that lands after a replacement produces a generation that is internally coherent for
-  that workspace — it is a valid, complete generation — but it may resurrect content the restore
-  intended to remove. It is never a partial or corrupt generation, because publication remains
-  atomic under the gate.
-- The operator-facing rule is therefore a documented limitation, not a silent hazard: **do not
-  run `restore`, `import`, or `repack` concurrently with indexing.** This belongs in the
-  operations documentation and release notes.
-- No active reader is affected: readers hold no lease, resolve a generation at open time, and a
-  replaced file simply invalidates their next open.
-
-**Recommended follow-up** (separate decision, not this one): whole-file operations additionally
-take a database-wide preparation barrier that excludes new pipeline leases. Not folded in here
-because it changes `restore`'s failure semantics, which today only has to exclude writers.
+**Contract (this decision).** Pipelines hold the database preparation barrier shared from before
+workspace-lease acquisition until the run ends. `restore`, `import`, and `repack` hold it
+exclusive before taking the writer gate. An exclusive operation therefore waits for existing
+preparation to finish and prevents new preparation from starting; stale prepared state cannot be
+published after file replacement. Active readers remain outside this barrier and resolve a
+generation at open time.
 
 ### Contract position: watcher and UI ownership
 
@@ -423,8 +418,7 @@ child work below.
 - A blocked `index_repository` now waits (or fails) where it previously ran and lost. Clients
   that fire an index on session start will see this; the refusal must be actionable.
 - One lock file per workspace accumulates in the cache directory and is never removed.
-- A pipeline may prepare while a `restore`/`import` replaces the database — see
-  [Open question](#open-question-whole-file-operations-vs-in-flight-preparation).
+- Whole-file operations now wait for active pipeline preparation before replacing the database.
 
 ### Deferred, not fixed
 
@@ -450,7 +444,7 @@ child work below.
 | Supervised worker re-acquires its parent's lease | Prevented by rule — worker inherits the right to work and never re-acquires (`index_supervisor.c:39-41`); a regression here is an immediate self-deadlock on every index | N/A |
 | Version skew after partial update | **Deferred / accepted** — detected only at open time and only for on-disk format (`cbm_zova.c:1350-1381`) | Fail-closed HELLO conflict for every participant (`service.h:38-47`); correct, but turns a partial update into a hard stop for all sessions |
 | Daemon dies mid-publish | N/A | New failure class: a generation left in `building` must compose with the existing `rebuild_required` / `whole_file_recovery` model (`README.md:478-482`) |
-| Whole-file replacement (compact/restore/import/repack) | Gate unchanged; one residual gap — a pipeline may prepare across a replacement (see [Open question](#open-question-whole-file-operations-vs-in-flight-preparation)) | Requires drain, quiesce, and post-swap invalidation of every pooled handle |
+| Whole-file replacement (compact/restore/import/repack) | Shared/exclusive preparation barrier drains pipelines before replacement; writer gate still serializes mutation | Requires drain, quiesce, and post-swap invalidation of every pooled handle |
 | Untrusted local account | Lock file is `0600` in the owner's cache dir; no rendezvous endpoint to attack | IPC endpoint is an account-wide rendezvous; upstream mitigates with owner-only DACLs (`3e540aac`) and randomized private directories |
 | Denial of service by over-strict admission | None — this decision adds no identity check | Broad: a mismatch can refuse all sessions until the operator intervenes |
 
@@ -461,16 +455,12 @@ child work below.
 Reopen the daemon question if **any** of the following is demonstrated. Each is written to be
 measurable so that this ADR cannot quietly become a permanent "no" by inertia.
 
-1. **Instrumented cost is proven material.** A cold-start and per-call baseline exists
-   (`resolve_store` open count, catalog scan time, prepared-statement rebuild cost) and shows
-   per-call overhead dominating p95 for representative queries. #24's profiling guards can
-   carry this instrumentation.
-2. **Duplicate in-flight work is observed in practice**, not just in theory: two MCP sessions on
+1. **Duplicate in-flight work is observed in practice**, not just in theory: two MCP sessions on
    one project contending for a lease often enough to matter, or repeated `ui.unavailable`
    reports from multi-agent users.
-3. **Per-workspace leases fail to relieve head-of-line blocking.** If measured contention stays
+2. **Per-workspace leases fail to relieve head-of-line blocking.** If measured contention stays
    high after the lease lands, the remaining value is broker-side coalescing.
-4. **Shared watcher/UI ownership is wanted** and the liveness contract (what happens when the
+3. **Shared watcher/UI ownership is wanted** and the liveness contract (what happens when the
    owning session dies) turns out to need a supervisor rather than a claim record.
 
 Absent these, the daemon's cost is not justified by any measured problem.
@@ -493,21 +483,25 @@ Absent these, the daemon's cost is not justified by any measured problem.
    index path (`pipeline.c:54-74`) so different workspaces prepare concurrently. **This is
    required for the concurrency target, not cleanup.** Keep in-process state protection for
    `srv->active_pipeline`.
+4. **Database preparation barrier** — add a shared/exclusive file-lock primitive. Indexing holds
+   it shared for the whole pipeline; `restore`, `import`, and `repack` hold it exclusive before
+   acquiring the writer gate. Test that replacement waits for preparation and that no post-restore
+   publish can resurrect the previous workspace state.
 
 ### Instrumentation (separate, feeds the revisit triggers)
 
-4. **Baseline counters** — store opens per tool call, catalog scan duration, prepared-statement
+5. **Baseline counters** — store opens per tool call, catalog scan duration, prepared-statement
    cache misses, and cold-start time. Fits #24's profiling guards. Nothing in this ADR should be
    justified by unmeasured startup cost again.
 
 ### Deferred — needs its own design before any work starts
 
-5. **Build-cohort admission** — separate design for the compatibility contract: which identity
+6. **Build-cohort admission** — separate design for the compatibility contract: which identity
    fields (binary fingerprint, protocol/store/feature ABI, cache-root fingerprint, pinned-Zova
    commit), what is refused (writers only, or every participant), and how a refusal is surfaced
    to operators. The liveness question — what happens to in-flight work when a cohort conflict
    is detected — is the hard part.
-6. **Shared watcher and UI ownership** — separate design for the liveness contract: ownership
+7. **Shared watcher and UI ownership** — separate design for the liveness contract: ownership
    claim, transfer on owner death, and behaviour for a session that outlives its owner. Requires
    answering whether a claim record is sufficient or a supervisor is needed.
 
